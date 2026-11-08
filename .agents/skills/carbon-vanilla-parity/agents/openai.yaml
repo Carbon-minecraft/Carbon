@@ -1,0 +1,4 @@
+interface:
+  display_name: "Carbon Vanilla Parity"
+  short_description: "Test parity; prepare PRs for verified Carbon fixes"
+  default_prompt: "Use $carbon-vanilla-parity to compare Carbon with Java 26.3 and prepare an alpha-test PR for a verified, in-scope Carbon fix."

@@ -1,0 +1,349 @@
+{
+  "target_version": "26.3",
+  "jar_classes": [
+    "net/minecraft/world/level/levelgen/BitRandomSource.class",
+    "net/minecraft/util/SimpleBitStorage.class",
+    "net/minecraft/world/level/levelgen/LegacyRandomSource.class",
+    "net/minecraft/world/level/levelgen/SingleThreadedRandomSource.class",
+    "net/minecraft/world/level/levelgen/XoroshiroRandomSource.class"
+  ],
+  "harnesses": [
+    {
+      "name": "Legacy RNG",
+      "files": [
+        "tests/parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/world/level/levelgen/LegacyRandomSource.java",
+        "net/minecraft/world/level/levelgen/BitRandomSource.java",
+        "net/minecraft/world/level/levelgen/MarsagliaPolarGaussian.java"
+      ],
+      "tier": "mixed-source-and-jar-interface",
+      "claim": "Supplied LegacyRandomSource and Gaussian source classes execute against the exact BitRandomSource.class copied from the 26.3 jar. This is a hybrid source/binary reference; the separate raw-jar harness checks the unmodified RNG classes directly.",
+      "reviewed_sha256": {
+        "tests/parity.py": "4d27869cd5ec2ebb6f64448c1bc470bf35a5a6acf1a286426482081f849ae4d9",
+        "java:net/minecraft/world/level/levelgen/LegacyRandomSource.java": "4a1585f62941e27f5c800e10dd6b61d5b8643f472733014977da71f8be69757d",
+        "java:net/minecraft/world/level/levelgen/BitRandomSource.java": "1bc4aacc98a03c6f31b13ff752358fe601ae08b20dd4d6839c9e3b041cd8ff46",
+        "java:net/minecraft/world/level/levelgen/MarsagliaPolarGaussian.java": "ff4a2a5de67e5e085818cb883b256596588fa4e6ad6d1c958ff08eceb892ffcc"
+      },
+      "components": [
+        {
+          "name": "LegacyRandomSource and MarsagliaPolarGaussian",
+          "tier": "supplied-decompiled-source-classes",
+          "claim": "Compiled from the supplied source tree with small test driver/dependency stubs."
+        },
+        {
+          "name": "BitRandomSource",
+          "tier": "exact-jar-class-interface",
+          "claim": "The class bytes are copied from the supplied jar; the decompiled source file is not used for compilation."
+        }
+      ]
+    },
+    {
+      "name": "Packed bit storage",
+      "files": [
+        "tests/bit_storage_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/util/BitStorage.java",
+        "net/minecraft/util/SimpleBitStorage.java",
+        "net/minecraft/util/ZeroBitStorage.java"
+      ],
+      "tier": "unmodified-supplied-classes",
+      "claim": "Compiles supplied storage classes with unrelated annotation/validation stubs.",
+      "reviewed_sha256": {
+        "tests/bit_storage_parity.py": "2b9cc756f5d440ba120213c082b7f1085267780e4abfcfaed04b4c4e40502f46",
+        "java:net/minecraft/util/BitStorage.java": "5eb4386f42f76986188db8d06a5e1e62bfaa270069d92c2093dceec476de74c9",
+        "java:net/minecraft/util/SimpleBitStorage.java": "78122b39377d8ca823ef5bb7a20c98db69a5a38142e02656cd9771c75c6f1b14",
+        "java:net/minecraft/util/ZeroBitStorage.java": "08c33340132d8888c1d6a58fdf5d376ba6187200717b65dab10321000cdc0fcd"
+      }
+    },
+    {
+      "name": "Coordinates",
+      "files": [
+        "tests/coordinates_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/core/BlockPos.java",
+        "net/minecraft/core/SectionPos.java"
+      ],
+      "tier": "extracted-methods",
+      "claim": "Selected Java methods are copied from supplied sources at test time; verify exact method set before extending the claim.",
+      "reviewed_sha256": {
+        "tests/coordinates_parity.py": "bed01fdbfd4d52f74e8adde05583dfb7e8dbe8c4eb7900fae92decf855058321",
+        "java:net/minecraft/core/BlockPos.java": "04dfd5e7e360463562091d2546b1fd33d061b5d6e798d509ae1fea7cb3036029",
+        "java:net/minecraft/core/SectionPos.java": "e60fe513acdec14d767f21d6453775f60060245015d3b77b99f7690cb9b3eace"
+      }
+    },
+    {
+      "name": "Directions and rotations",
+      "files": [
+        "tests/direction_parity.py"
+      ],
+      "tier": "handwritten-source-derived-oracle",
+      "claim": "Oracle logic is handwritten from source semantics; JVM execution alone does not make it an independent vanilla implementation.",
+      "reviewed_sha256": {
+        "tests/direction_parity.py": "f5c3620751a21b47f4b7d4d747ea9916b81a9dc5045fd2972e475abeb10c7175"
+      }
+    },
+    {
+      "name": "AABB geometry",
+      "files": [
+        "tests/geometry_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/world/phys/AABB.java"
+      ],
+      "tier": "extracted-methods",
+      "claim": "Small Java oracle assembled from selected supplied AABB methods.",
+      "reviewed_sha256": {
+        "tests/geometry_parity.py": "bd3060182c58056b38196bc2e1b75c57e7ccd9b89ade1dfdfa4a2adf9aba101f",
+        "java:net/minecraft/world/phys/AABB.java": "327797ec6c122af01effa6daafceb325a51aac1393c366759558c23892d26758"
+      }
+    },
+    {
+      "name": "Light storage and height access",
+      "files": [
+        "tests/light_storage_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/world/level/chunk/DataLayer.java",
+        "net/minecraft/world/level/LevelHeightAccessor.java"
+      ],
+      "tier": "unmodified-supplied-classes",
+      "claim": "Supplied classes execute with their included dependencies/stubs; check harness sources for the exact dependency boundary.",
+      "reviewed_sha256": {
+        "tests/light_storage_parity.py": "3610b370db69deceeb909a888364daf339a2a3a3e3a7781eb07b63436728961e",
+        "java:net/minecraft/world/level/chunk/DataLayer.java": "af66bb1ada87607cae3dec027920b9db00e1d20a666a06442faf5e8802cdd827",
+        "java:net/minecraft/world/level/LevelHeightAccessor.java": "6c67d6acabf8fe760d38c9d15497cb5efa893d744b65b4e8b69e3b2eebf69a9a"
+      }
+    },
+    {
+      "name": "Math subset",
+      "files": [
+        "tests/math_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/util/Mth.java"
+      ],
+      "tier": "extracted-methods",
+      "claim": "Selected Mth methods are compared; no claim about the complete Mth class.",
+      "reviewed_sha256": {
+        "tests/math_parity.py": "9c2252369defde636f986125b5502bb2f222b7ae5a3501d5f69d4f6de871c0d7",
+        "java:net/minecraft/util/Mth.java": "907b0d18e2db605f6b4f6c459d9ac3d941a65790f15c24aec3d10ea61e822edb"
+      }
+    },
+    {
+      "name": "Simplex noise",
+      "files": [
+        "tests/noise_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/world/level/levelgen/synth/GradientNoise.java",
+        "net/minecraft/world/level/levelgen/synth/SimplexNoise.java"
+      ],
+      "tier": "supplied-source-classes-with-handwritten-adapters",
+      "claim": "GradientNoise and SimplexNoise source classes execute unchanged with a handwritten Java RandomSource adapter and minimal test interfaces/stubs; this is not raw-jar noise execution.",
+      "reviewed_sha256": {
+        "tests/noise_parity.py": "3e50c99dad806b993e220fd6400e04fdb967a950e1ceaf89ebb888c59e56cdf1",
+        "java:net/minecraft/world/level/levelgen/synth/GradientNoise.java": "72b85d35c0cd5030005897a24294cb34e11ac15abb1591155a80a7ff83beec0a",
+        "java:net/minecraft/world/level/levelgen/synth/SimplexNoise.java": "8983c7977ef0ad8f0308a39bfec3ef59118c1a326531b1b6d1a58d50fa3a6b53"
+      },
+      "components": [
+        {
+          "name": "GradientNoise and SimplexNoise",
+          "tier": "unmodified-supplied-source-classes",
+          "claim": "Copied from decompiled source at test time and compiled unchanged."
+        },
+        {
+          "name": "RandomSource and support methods",
+          "tier": "handwritten-test-adapters",
+          "claim": "A test RNG adapter supplies Java LCG operations; its double multiplier was reconciled with the actual jar class. This adapter is not the Minecraft RNG class."
+        }
+      ]
+    },
+    {
+      "name": "Palette subset",
+      "files": [
+        "tests/palette_parity.py",
+        "tests/palette.cpp"
+      ],
+      "tier": "native-assertions",
+      "claim": "Native test assertions; not a JVM differential harness.",
+      "reviewed_sha256": {
+        "tests/palette_parity.py": "c638e0028b41ba89234ea79af0053a0dc3c4d25ce98a20a1d22aec147403a667",
+        "tests/palette.cpp": "601bc2d01e184daacc33a25a509ef0239bd13b670ed34a9cc9547e633f92ce78"
+      }
+    },
+    {
+      "name": "Paletted container",
+      "files": [
+        "tests/paletted_container_parity.py",
+        "tests/paletted_container.cpp"
+      ],
+      "tier": "native-source-derived-assertions",
+      "claim": "Native assertions for selected source-derived behavior; not Java execution.",
+      "reviewed_sha256": {
+        "tests/paletted_container_parity.py": "6b0076166b65d78ce1631ab228d8832e2ba5a9c7bbe0631319a0421c15177dc5",
+        "tests/paletted_container.cpp": "4a73ac322c33fb0de28f1ecfa54d2eb4cfc8bd93b851af903221027938b0be35"
+      }
+    },
+    {
+      "name": "Random source subset",
+      "files": [
+        "tests/random_sources_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/world/level/levelgen/SingleThreadedRandomSource.java",
+        "net/minecraft/world/level/levelgen/BitRandomSource.java",
+        "net/minecraft/world/level/levelgen/MarsagliaPolarGaussian.java",
+        "net/minecraft/world/level/levelgen/Xoroshiro128PlusPlus.java"
+      ],
+      "tier": "mixed-source-jar-and-adapted-oracle",
+      "claim": "SingleThreadedRandomSource source executes with the exact jar BitRandomSource interface; the Xoroshiro128PlusPlus subset uses a source-adapted Java oracle with its CODEC removed and handwritten initialization/support. Do not read this whole harness as raw-jar parity.",
+      "reviewed_sha256": {
+        "tests/random_sources_parity.py": "5f476db54567d7950ef977166ac80b9667c9d06a04a00767e67ecaaaa22d0af7",
+        "java:net/minecraft/world/level/levelgen/SingleThreadedRandomSource.java": "9c7b3a43e37b70de4db35572e5eea14084cc20ea2732e1e6842b715c38f5c861",
+        "java:net/minecraft/world/level/levelgen/BitRandomSource.java": "1bc4aacc98a03c6f31b13ff752358fe601ae08b20dd4d6839c9e3b041cd8ff46",
+        "java:net/minecraft/world/level/levelgen/MarsagliaPolarGaussian.java": "ff4a2a5de67e5e085818cb883b256596588fa4e6ad6d1c958ff08eceb892ffcc",
+        "java:net/minecraft/world/level/levelgen/Xoroshiro128PlusPlus.java": "1eb8a8bbb0d965aa51dab9bcdb3e5013a031598585c6bdc8063b3fb25ae00f9a"
+      },
+      "components": [
+        {
+          "name": "SingleThreadedRandomSource",
+          "tier": "supplied-source-plus-jar-interface",
+          "claim": "Supplied SingleThreadedRandomSource source and Gaussian code compile against the exact BitRandomSource.class copied from the jar."
+        },
+        {
+          "name": "Xoroshiro128PlusPlus",
+          "tier": "adapted-source-jvm-oracle",
+          "claim": "CODEC code is stripped from source and test setup reproduces initialization; external Codec dependencies prevent raw JAR initialization coverage."
+        }
+      ]
+    },
+    {
+      "name": "Scheduled tick data",
+      "files": [
+        "tests/scheduled_ticks_parity.py",
+        "tests/scheduled_ticks_oracle.java"
+      ],
+      "tier": "handwritten-source-derived-model",
+      "claim": "Dependency-free Java fixture model. It does not execute Minecraft tick classes or codecs.",
+      "reviewed_sha256": {
+        "tests/scheduled_ticks_parity.py": "3c3bc65ce2b7a5dc7ff9d2b0c788ae2774072ca51d1498d1fd8a2a2610167d58",
+        "tests/scheduled_ticks_oracle.java": "d627ddbc35f80011eca53a49172a8030d6de5c02c9c7da82bb0e9d89228be0ae"
+      }
+    },
+    {
+      "name": "Terrain noise stack",
+      "files": [
+        "tests/terrain_noise_stack_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/world/level/levelgen/synth/GradientNoise.java",
+        "net/minecraft/world/level/levelgen/synth/PerlinNoise.java",
+        "net/minecraft/world/level/levelgen/synth/NoiseStack.java"
+      ],
+      "tier": "supplied-source-classes-with-handwritten-adapters",
+      "claim": "PerlinNoise, GradientNoise, and NoiseStack sources execute with test-written RNG and minimal API adapters; sampled float bits and RNG consumption are checked, not the full world-generation pipeline.",
+      "reviewed_sha256": {
+        "tests/terrain_noise_stack_parity.py": "116f5ad6877f22bc1027647a78ff61340a7475759bd3a0850a82748b6c3d0a1c",
+        "java:net/minecraft/world/level/levelgen/synth/GradientNoise.java": "72b85d35c0cd5030005897a24294cb34e11ac15abb1591155a80a7ff83beec0a",
+        "java:net/minecraft/world/level/levelgen/synth/PerlinNoise.java": "00d8d9812515afb75312365fca8f86abb6f039fd8dab8ad363f29fc092b89b24",
+        "java:net/minecraft/world/level/levelgen/synth/NoiseStack.java": "f64a4ee4c35e42520562aee377d96d7a70570f26707c33f0b389e6bc28ddde18"
+      },
+      "components": [
+        {
+          "name": "PerlinNoise, GradientNoise, NoiseStack",
+          "tier": "unmodified-supplied-source-classes",
+          "claim": "Selected classes are copied from supplied decompiled sources and compiled unchanged."
+        },
+        {
+          "name": "RandomSource and supporting API",
+          "tier": "handwritten-test-adapters",
+          "claim": "The test provides a Java RNG implementation and interfaces/stubs; its double operation uses the multiplier verified against the actual jar class, but does not execute that jar class."
+        }
+      ]
+    },
+    {
+      "name": "Advanced noise",
+      "files": [
+        "tests/advanced_noise_parity.py"
+      ],
+      "source_files": [
+        "net/minecraft/world/level/levelgen/synth/NormalNoise.java"
+      ],
+      "tier": "handwritten-source-derived-model",
+      "claim": "The test Java oracle re-expresses selected NormalNoise initialization/sample behavior over the generated noise subset. It does not execute supplied NormalNoise.java or the raw jar class.",
+      "reviewed_sha256": {
+        "tests/advanced_noise_parity.py": "7ebb830b672957bb28714af78f289b1dbe1c66c01c6ea32352b3f087f767dcd9",
+        "java:net/minecraft/world/level/levelgen/synth/NormalNoise.java": "7cfd81358611177f12623fbbd7c4234d765581202a09a886f1b7af23af782a60"
+      }
+    },
+    {
+      "name": "Binary IO",
+      "files": [
+        "tests/binary_io_parity.py"
+      ],
+      "tier": "source-mirrored-jvm-check",
+      "claim": "JVM byte comparison; script comments identify VarInt portions that mirror source rather than execute supplied methods.",
+      "reviewed_sha256": {
+        "tests/binary_io_parity.py": "b27e9be29a84d9f6c8d27c159cbb1dd553c19fc8d601ea752f3656b569bacff0"
+      }
+    },
+    {
+      "name": "Voxel shapes",
+      "files": [
+        "tests/voxel_shapes_parity.py",
+        "tests/VoxelShapesOracle.java"
+      ],
+      "source_files": [
+        "net/minecraft/world/phys/shapes/VoxelShape.java"
+      ],
+      "tier": "adapted-jvm-oracle",
+      "claim": "Oracle is adapted from selected source behavior; not execution of the complete Minecraft shape stack.",
+      "reviewed_sha256": {
+        "tests/voxel_shapes_parity.py": "660608a64fc708865353f0373b9e2a6efd284b6d3f37e69c929be5a0de2b9a36",
+        "tests/VoxelShapesOracle.java": "74140e3f8d81ac4b0c300486be688149f76b37fee19b8b48ac7a425eb6230cf5",
+        "java:net/minecraft/world/phys/shapes/VoxelShape.java": "7baac6a3707e5f640e4809509aa7adff1515155aa896e76558476b5adfb9253f"
+      }
+    },
+    {
+      "name": "Raw jar RNG",
+      "files": [
+        "tests/raw_jar_rng_parity.py"
+      ],
+      "tier": "unmodified-supplied-jar-class-runtime",
+      "claim": "A Java driver calls unmodified LegacyRandomSource and SingleThreadedRandomSource classes from the supplied 26.3 jar; Carbon trace outputs match 2,560 ordered rows across ten seeds. XoroshiroRandomSource.class is hashed but not exercised by this script.",
+      "components": [
+        {
+          "name": "LegacyRandomSource and SingleThreadedRandomSource",
+          "tier": "raw-jar-runtime",
+          "claim": "The driver instantiates these actual classes through the exact 26.3 jar classpath and compares each emitted raw-bit trace."
+        },
+        {
+          "name": "XoroshiroRandomSource",
+          "tier": "jar-provenance-only",
+          "claim": "The class entry hash is printed, but no xoro instance is created in the current loops."
+        }
+      ],
+      "jar_classes_used": [
+        "net/minecraft/world/level/levelgen/BitRandomSource.class",
+        "net/minecraft/world/level/levelgen/LegacyRandomSource.class",
+        "net/minecraft/world/level/levelgen/SingleThreadedRandomSource.class"
+      ],
+      "reviewed_sha256": {
+        "tests/raw_jar_rng_parity.py": "58ba48abf0ea09dbea53a5361b911e8b5f29649abe55f3ce857ac6e3b3aa3c3b"
+      }
+    }
+  ],
+  "reviewed_version_sha256": "70444a856374443fbd57e4b23e9acfdd50309b25906ced3e3cf658abf25dd3ae",
+  "reviewed_jar_sha256": "4508d006323f24fa02876310c192d739af56516eb259000ac50f0909a68c9a2d",
+  "reviewed_jar_classes": {
+    "net/minecraft/world/level/levelgen/BitRandomSource.class": "b23f553e495a8e525ee5e24b8a4980224c0d2b8e34bd8115223960cee0f73de5",
+    "net/minecraft/util/SimpleBitStorage.class": "52633a8a86ec91d805c7e8c615b4e3ab81926b7eb73286969cf22045738fc2a9",
+    "net/minecraft/world/level/levelgen/LegacyRandomSource.class": "a54d9c4c06cd9a6d11bf93856fbeff594903c0b70baea933b883e6c5122746a2",
+    "net/minecraft/world/level/levelgen/SingleThreadedRandomSource.class": "f06bc15ef3a7a61b0e09f9ed06b4362eddd289e5561046e98a335bcaefa0aaa0",
+    "net/minecraft/world/level/levelgen/XoroshiroRandomSource.class": "43c6e33b55c91bd4576d2cf04ba7e5e7d2561c5918e1b3549485639d17906447"
+  }
+}
