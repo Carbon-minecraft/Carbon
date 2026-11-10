@@ -37,19 +37,20 @@ struct MaterialRuleSample {
     std::function<double(std::string_view, int, int, int)> noise3d;
 };
 
-// Source-data-backed interpreter for the two biome surface rule roots used by
-// the vanilla single_biome_surface preset (fixed minecraft:plains). It reads
-// original `data/minecraft/worldgen/material_rule` JSON in place.
+// Source-data-backed interpreter for the biome surface rules selected by the
+// supplied vanilla Overworld presets. It reads original material-rule JSON.
 class PlainsSurfaceRules {
 public:
     explicit PlainsSurfaceRules(std::filesystem::path decompiledRoot);
     bool presetMatchesSource() const noexcept { return presetMatchesSource_; }
+    bool normalPresetMatchesSource() const noexcept { return normalPresetMatchesSource_; }
     const std::string& error() const noexcept { return error_; }
     std::optional<std::string> surfaceBlockAt(const MaterialRuleSample& sample);
 
 private:
     std::filesystem::path dataRoot_;
     bool presetMatchesSource_{};
+    bool normalPresetMatchesSource_{};
     std::string error_;
     std::map<std::string, nlohmann::json, std::less<>> jsonCache_;
     const nlohmann::json* loadJson(std::string_view root, std::string_view id);

@@ -22,8 +22,16 @@ struct DensityContext {
     std::function<float(const nlohmann::json&, DensityPos)> external;
     struct MemoKey { const void* node{}; int x{},y{},z{}; bool operator==(const MemoKey&) const = default; };
     struct MemoHash { std::size_t operator()(const MemoKey& k) const noexcept; };
+    struct InterpolatedVolume {
+        const void* node{};
+        int minX{}, minY{}, minZ{}, sizeX{}, sizeY{}, sizeZ{};
+        std::vector<float> values;
+        float at(int x, int y, int z) const;
+    };
     std::shared_ptr<std::unordered_map<MemoKey,float,MemoHash>> memo =
         std::make_shared<std::unordered_map<MemoKey,float,MemoHash>>();
+    std::shared_ptr<std::unordered_map<const void*, InterpolatedVolume>> interpolatedVolumes =
+        std::make_shared<std::unordered_map<const void*, InterpolatedVolume>>();
 };
 
 struct RawDensityChunk {
@@ -41,6 +49,8 @@ public:
     float sample(const std::string& key, DensityPos pos, const DensityContext& context) const;
     float sampleExpression(const nlohmann::json& expression, DensityPos pos,
                            const DensityContext& context) const;
+    void prepareInterpolatedChunk(const std::string& key, int chunkX, int chunkZ,
+                                  int minY, int height, const DensityContext& context) const;
     static std::string firstUnsupported(const std::filesystem::path& dataRoot,
                                         const std::string& key);
 private:
@@ -64,6 +74,7 @@ public:
         float function(const std::string& identifier,int blockX,int blockY,int blockZ) const;
         float finalDensity(int blockX,int blockY,int blockZ) const;
         float noise(const std::string& identifier,double x,double y,double z) const;
+        void prepareFinalDensityChunk(int chunkX,int chunkZ) const;
     private:
         friend class SeededOverworldDensity;
         Session(const SeededOverworldDensity* owner,DensityContext context):owner_(owner),context_(std::move(context)){}

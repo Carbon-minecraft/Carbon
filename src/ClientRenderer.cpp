@@ -4,10 +4,13 @@
 #include "carbon/SlabBlock.hpp"
 #include "carbon/StairsBlock.hpp"
 #include "carbon/FenceBlock.hpp"
+#include "carbon/SourceFluidRenderer.hpp"
+#include "nlohmann/json.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <GL/gl.h>
+#include <bcrypt.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 
@@ -23,6 +26,7 @@
 #include <map>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -30,14 +34,184 @@
 #pragma comment(lib, "opengl32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace carbon {
 namespace {
 using Microsoft::WRL::ComPtr;
 
+std::optional<std::string> hashFile(const std::filesystem::path& path, LPCWSTR algorithm) {
+    BCRYPT_ALG_HANDLE provider{};
+    BCRYPT_HASH_HANDLE hash{};
+    if (BCryptOpenAlgorithmProvider(&provider,algorithm,nullptr,0)<0) return std::nullopt;
+    auto closeProvider=[&] { if(provider) BCryptCloseAlgorithmProvider(provider,0); };
+    DWORD objectLength{},hashLength{},resultLength{};
+    if(BCryptGetProperty(provider,BCRYPT_OBJECT_LENGTH,reinterpret_cast<PUCHAR>(&objectLength),sizeof(objectLength),&resultLength,0)<0 ||
+       BCryptGetProperty(provider,BCRYPT_HASH_LENGTH,reinterpret_cast<PUCHAR>(&hashLength),sizeof(hashLength),&resultLength,0)<0) {
+        closeProvider(); return std::nullopt;
+    }
+    std::vector<UCHAR> object(objectLength),digest(hashLength);
+    if(BCryptCreateHash(provider,&hash,object.data(),objectLength,nullptr,0,0)<0) {
+        closeProvider(); return std::nullopt;
+    }
+    std::ifstream input(path,std::ios::binary);
+    std::array<char,64*1024> buffer{};
+    bool good=static_cast<bool>(input);
+    while(good && input) {
+        input.read(buffer.data(),static_cast<std::streamsize>(buffer.size()));
+        const auto count=input.gcount();
+        if(count>0 && BCryptHashData(hash,reinterpret_cast<PUCHAR>(buffer.data()),static_cast<ULONG>(count),0)<0) good=false;
+    }
+    if(input.bad()) good=false;
+    if(!good || BCryptFinishHash(hash,digest.data(),hashLength,0)<0) {
+        BCryptDestroyHash(hash); closeProvider(); return std::nullopt;
+    }
+    BCryptDestroyHash(hash); closeProvider();
+    constexpr char hex[]="0123456789abcdef";
+    std::string result; result.reserve(digest.size()*2);
+    for(const auto byte:digest) { result.push_back(hex[byte>>4]); result.push_back(hex[byte&15]); }
+    return result;
+}
+
+bool normalizeSha1(std::string_view value,std::string& normalized) {
+    if(value.size()!=40) return false;
+    normalized.clear(); normalized.reserve(value.size());
+    for(char c:value) {
+        if(c>='0'&&c<='9') normalized.push_back(c);
+        else if(c>='a'&&c<='f') normalized.push_back(c);
+        else if(c>='A'&&c<='F') normalized.push_back(static_cast<char>(c-'A'+'a'));
+        else return false;
+    }
+    return true;
+}
+
+bool safeVersionComponent(std::string_view value) {
+    return !value.empty() && value!="." && value!=".." &&
+        std::all_of(value.begin(),value.end(),[](char c) {
+            return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='.'||c=='_'||c=='-';
+        });
+}
+
+std::vector<std::filesystem::path> installedMinecraftRoots() {
+    std::vector<std::filesystem::path> candidates;
+    auto addCandidate=[&](std::filesystem::path candidate) {
+        if(!candidate.empty() && std::find(candidates.begin(),candidates.end(),candidate)==candidates.end())
+            candidates.push_back(std::move(candidate));
+    };
+    std::wstring configured(32768,L'\0');
+    const DWORD configuredLength=GetEnvironmentVariableW(L"CARBON_MINECRAFT_DIR",configured.data(),static_cast<DWORD>(configured.size()));
+    if(configuredLength>0 && configuredLength<configured.size()) {
+        configured.resize(configuredLength); addCandidate(std::filesystem::path(configured));
+    }
+    std::wstring roaming(32768,L'\0');
+    const DWORD roamingLength=GetEnvironmentVariableW(L"APPDATA",roaming.data(),static_cast<DWORD>(roaming.size()));
+    if(roamingLength>0 && roamingLength<roaming.size()) {
+        roaming.resize(roamingLength);
+        addCandidate(std::filesystem::path(roaming)/L".minecraft");
+        addCandidate(std::filesystem::path(roaming)/L"horizon-launcher"/L"minecraft");
+    }
+    return candidates;
+}
+
+void loadVerifiedIndexedAssets(const std::filesystem::path& sourceRoot,
+                               std::filesystem::path& objectRoot,
+                               std::map<std::string,std::string,std::less<>>& hashes) {
+    try {
+        nlohmann::json sourceVersion;
+        { std::ifstream input(sourceRoot/L"version.json"); if(!input) return; input>>sourceVersion; }
+        const std::string versionId=sourceVersion.at("id").get<std::string>();
+        if(!safeVersionComponent(versionId)) return;
+        const auto versionName=std::filesystem::path(versionId);
+        const auto sourceJar=sourceRoot.parent_path()/(versionId+".jar");
+        const auto sourceJarHash=hashFile(sourceJar,BCRYPT_SHA256_ALGORITHM);
+        if(!sourceJarHash) return;
+        for(const auto& gameRoot:installedMinecraftRoots()) {
+            try {
+                const auto installedVersionDirectory=gameRoot/"versions"/versionName;
+                const auto installedMetadataPath=installedVersionDirectory/(versionId+".json");
+                nlohmann::json installedMetadata;
+                { std::ifstream input(installedMetadataPath); if(!input) continue; input>>installedMetadata; }
+                if(installedMetadata.at("id").get<std::string>()!=versionId) continue;
+                const auto installedJarHash=hashFile(installedVersionDirectory/(versionId+".jar"),BCRYPT_SHA256_ALGORITHM);
+                if(!installedJarHash || *installedJarHash!=*sourceJarHash) continue;
+                const auto& assetInfo=installedMetadata.at("assetIndex");
+                const std::string indexId=assetInfo.at("id").get<std::string>();
+                const std::string expectedIndexHash=assetInfo.at("sha1").get<std::string>();
+                std::string normalizedIndexHash;
+                if(!safeVersionComponent(indexId) || !normalizeSha1(expectedIndexHash,normalizedIndexHash)) continue;
+                const auto indexPath=gameRoot/"assets"/"indexes"/(indexId+".json");
+                const auto actualIndexHash=hashFile(indexPath,BCRYPT_SHA1_ALGORITHM);
+                if(!actualIndexHash || *actualIndexHash!=normalizedIndexHash) continue;
+                nlohmann::json index;
+                { std::ifstream input(indexPath); if(!input) continue; input>>index; }
+                std::map<std::string,std::string,std::less<>> candidateHashes;
+                const auto& objects=index.at("objects");
+                for(auto it=objects.begin();it!=objects.end();++it) {
+                    std::string normalizedObjectHash;
+                    const std::string objectHash=it.value().at("hash").get<std::string>();
+                    if(normalizeSha1(objectHash,normalizedObjectHash)) candidateHashes.emplace(it.key(),std::move(normalizedObjectHash));
+                }
+                objectRoot=gameRoot/"assets"/"objects";
+                hashes=std::move(candidateHashes);
+                return;
+            } catch(...) {
+                continue;
+            }
+        }
+    } catch(...) {
+        objectRoot.clear(); hashes.clear();
+    }
+}
+
 std::uint64_t mixHash(std::uint64_t h, std::uint64_t v) {
     h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
     return h;
+}
+
+using Rgb = std::array<float,3>;
+
+Rgb parseSourceRgb(std::string_view value) {
+    if (!value.empty() && value.front()=='#') value.remove_prefix(1);
+    if (value.size()==8) value.remove_prefix(2); // Source ARGB values use alpha first.
+    if (value.size()!=6) throw std::runtime_error("source color must be #RRGGBB or #AARRGGBB");
+    const auto channel=[&](std::size_t at) {
+        unsigned parsed=0;
+        for(std::size_t i=at;i<at+2;++i) {
+            const char c=value[i];
+            const unsigned digit=c>='0'&&c<='9'?static_cast<unsigned>(c-'0'):
+                c>='a'&&c<='f'?static_cast<unsigned>(c-'a'+10):
+                c>='A'&&c<='F'?static_cast<unsigned>(c-'A'+10):16u;
+            if(digit>15) throw std::runtime_error("invalid hexadecimal source color");
+            parsed=(parsed<<4)|digit;
+        }
+        return static_cast<float>(parsed)/255.0F;
+    };
+    return {channel(0),channel(2),channel(4)};
+}
+
+Rgb multiplyRgb(const Rgb& a,const Rgb& b) noexcept {
+    return {a[0]*b[0],a[1]*b[1],a[2]*b[2]};
+}
+
+Rgb lerpRgb(float alpha,const Rgb& from,const Rgb& to) noexcept {
+    return {from[0]+(to[0]-from[0])*alpha,from[1]+(to[1]-from[1])*alpha,from[2]+(to[2]-from[2])*alpha};
+}
+
+template<class Keyframes>
+Rgb sampleSourceTimelineColor(const Keyframes& keyframes,std::int64_t period,std::uint64_t ticks,const Rgb& fallback) noexcept {
+    if(keyframes.empty()||period<=0) return fallback;
+    const auto time=static_cast<std::int64_t>(ticks%static_cast<std::uint64_t>(period));
+    const auto after=std::find_if(keyframes.begin(),keyframes.end(),[&](const auto& key){return key.tick>time;});
+    const auto before=after==keyframes.begin()?keyframes.end():std::prev(after);
+    if(after==keyframes.end()&&before==keyframes.end()) return keyframes.front().rgb;
+    const auto fromTick=before==keyframes.end()?keyframes.back().tick-period:before->tick;
+    const auto toTick=after==keyframes.end()?keyframes.front().tick+period:after->tick;
+    const auto& from=before==keyframes.end()?keyframes.back().rgb:before->rgb;
+    const auto& to=after==keyframes.end()?keyframes.front().rgb:after->rgb;
+    if(time<=fromTick) return from;
+    if(time>=toTick) return to;
+    const float alpha=static_cast<float>(time-fromTick)/static_cast<float>(toTick-fromTick);
+    return lerpRgb(alpha,from,to);
 }
 
 Direction directionFromName(std::string_view value) {
@@ -50,7 +224,7 @@ VoxelShape renderCollisionShape(const BlockInstance& b) {
     case BlockId::StoneSlab: return slabVoxelShape(b.slabType);
     case BlockId::StoneStairs: return stairsVoxelShape(b.stairFacing,b.stairHalf,b.stairShape);
     case BlockId::OakFence: return fenceCollisionShape(b.fenceConnections);
-    case BlockId::Air: case BlockId::Water: return Shapes::empty();
+    case BlockId::Air: case BlockId::Water: case BlockId::Lava: return Shapes::empty();
     default: return Shapes::block();
     }
 }
@@ -474,6 +648,27 @@ bool ClientRenderer::initialize(HWND window, int width, int height,
     stats_.glVersion=glText(GL_VERSION);
     resourceRoot_ = std::move(sourceRoot);
     textureRoot_ = resourceRoot_ / L"assets" / L"minecraft" / L"textures";
+    indexedAssetObjectsRoot_.clear(); indexedAssetHashes_.clear();
+    loadVerifiedIndexedAssets(resourceRoot_,indexedAssetObjectsRoot_,indexedAssetHashes_);
+    try {
+        std::ifstream timelineInput(resourceRoot_/"data"/"minecraft"/"timeline"/"day.json",std::ios::binary);
+        if(!timelineInput) throw std::runtime_error("missing source timeline/day.json");
+        const auto timeline=nlohmann::json::parse(timelineInput);
+        dayTimelinePeriod_=timeline.value("period_ticks",24000);
+        const auto loadColorTrack=[&](std::string_view name,std::vector<TimeColorKeyframe>& output) {
+            const auto found=timeline.at("tracks").find(std::string(name));
+            if(found==timeline.at("tracks").end()) return;
+            for(const auto& frame:found->at("keyframes"))
+                output.push_back({frame.at("ticks").get<std::int64_t>(),parseSourceRgb(frame.at("value").get<std::string>())});
+        };
+        skyColorTimeline_.clear(); fogColorTimeline_.clear(); biomeVisualColors_.clear();
+        loadColorTrack("minecraft:visual/sky_color",skyColorTimeline_);
+        loadColorTrack("minecraft:visual/fog_color",fogColorTimeline_);
+    } catch(const std::exception& exception) {
+        lastError_="Could not load supplied Overworld day timeline: "+std::string(exception.what());
+        if(error) *error=lastError_;
+        shutdown(); return false;
+    }
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ownsComInitialization_ = SUCCEEDED(comResult);
     Image grassMap;
@@ -496,20 +691,54 @@ bool ClientRenderer::initialize(HWND window, int width, int height,
     grassTintG_=grassMap.rgba[grassAt+1]/255.0f;
     grassTintB_=grassMap.rgba[grassAt+2]/255.0f;
     Image asciiFont;
-    if (!readPng(textureRoot_ / L"font" / L"ascii.png", asciiFont) || asciiFont.width<128 || asciiFont.height<128) {
+    if (!readPng(textureRoot_ / L"font" / L"ascii.png", asciiFont) ||
+        asciiFont.width<16 || asciiFont.height<16 || asciiFont.width%16!=0 || asciiFont.height%16!=0) {
         lastError_="Could not decode supplied 128 by 128 assets/minecraft/textures/font/ascii.png";
         if (error) *error=lastError_;
         shutdown(); return false;
     }
-    glyphWidths_.fill(4);
+    fontAtlasWidth_=static_cast<int>(asciiFont.width);
+    fontAtlasHeight_=static_cast<int>(asciiFont.height);
+    fontGlyphCellWidth_=fontAtlasWidth_/16;
+    fontGlyphCellHeight_=fontAtlasHeight_/16;
+    glyphWidths_.fill(0);
+    glyphAdvances_.fill(1.0f);
+    glyphAdvances_[static_cast<unsigned char>(' ')]=4.0f;
+    const float bitmapScale=8.0f/static_cast<float>(fontGlyphCellHeight_);
     for (int code=32;code<128;++code) {
-        const int cellX=(code%16)*8, cellY=(code/16)*8;
+        const int cellX=(code%16)*fontGlyphCellWidth_, cellY=(code/16)*fontGlyphCellHeight_;
         int rightmost=-1;
-        for (int y=0;y<8;++y) for (int x=0;x<8;++x) {
+        for (int y=0;y<fontGlyphCellHeight_;++y) for (int x=0;x<fontGlyphCellWidth_;++x) {
             const auto at=(static_cast<std::size_t>(cellY+y)*asciiFont.width+cellX+x)*4;
             if (asciiFont.rgba[at+3]!=0) rightmost=std::max(rightmost,x);
         }
-        if (rightmost>=0) glyphWidths_[code]=static_cast<std::uint8_t>(rightmost+1);
+        const int visibleWidth=rightmost+1;
+        if (visibleWidth>=0) {
+            glyphWidths_[code]=static_cast<std::uint8_t>(std::min(visibleWidth,255));
+            glyphAdvances_[code]=static_cast<float>(static_cast<int>(0.5f+visibleWidth*bitmapScale)+1);
+        }
+    }
+    // FontManager resolves minecraft:font/default in provider order. Its
+    // first reference is minecraft:include/space, whose provider wins for
+    // U+0020 before the later ASCII bitmap provider can claim that glyph.
+    try {
+        nlohmann::json defaultFont;
+        { std::ifstream input(resourceRoot_/L"assets"/L"minecraft"/L"font"/L"default.json"); if(input) input>>defaultFont; }
+        for(const auto& provider:defaultFont.at("providers")) {
+            if(provider.value("type",std::string{})!="reference" ||
+               provider.value("id",std::string{})!="minecraft:include/space") continue;
+            nlohmann::json spaces;
+            { std::ifstream input(resourceRoot_/L"assets"/L"minecraft"/L"font"/L"include"/L"space.json"); if(input) input>>spaces; }
+            for(const auto& spaceProvider:spaces.at("providers")) {
+                if(spaceProvider.value("type",std::string{})!="space") continue;
+                const auto& advances=spaceProvider.at("advances");
+                if(advances.contains(" ")) glyphAdvances_[static_cast<unsigned char>(' ')]=advances.at(" ").get<float>();
+            }
+            break;
+        }
+    } catch(...) {
+        // The supplied 26.3 provider assigns a four-pixel space above; malformed
+        // or missing optional font metadata keeps that source default.
     }
     RECT clientRect{};
     if (GetClientRect(window_, &clientRect))
@@ -561,14 +790,87 @@ void ClientRenderer::resize(int width, int height) {
 
 void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerState& player,
                             const ClientHud& hud, std::uint64_t sceneRevision,
-                            std::uint64_t snapshotToken) {
+                            std::uint64_t snapshotToken,
+                            const RenderBlockBounds* fluidNeighborhoodBounds,
+                            const WorldVisualState* worldVisual) {
     const auto frameStart=std::chrono::steady_clock::now();
     if (!context_) return;
     if (!wglMakeCurrent(dc_, context_)) {
         if (!loggedContextFailure_) { lastError_="wglMakeCurrent failed during render"; OutputDebugStringW(L"Carbon renderer: wglMakeCurrent failed during render\n"); loggedContextFailure_=true; }
         return;
     }
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    const GLboolean blendWasEnabled=glIsEnabled(GL_BLEND);
+    const GLboolean depthWasEnabledBeforeFrame=glIsEnabled(GL_DEPTH_TEST);
+    const WorldVisualState visual=worldVisual?*worldVisual:WorldVisualState{};
+    auto colors=biomeVisualColors_.find(visual.biomeId);
+    if(colors==biomeVisualColors_.end()) {
+        BiomeVisualColors parsed{}; // EnvironmentAttributes RGB defaults are zero.
+        try {
+            const auto colon=visual.biomeId.find(':');
+            if(colon==std::string_view::npos || colon==0 || colon+1>=visual.biomeId.size())
+                throw std::runtime_error("invalid biome identifier");
+            const auto biomeFile=resourceRoot_/L"data"/std::filesystem::path(visual.biomeId.substr(0,colon))/
+                L"worldgen"/L"biome"/(std::filesystem::path(visual.biomeId.substr(colon+1)).concat(L".json"));
+            std::ifstream input(biomeFile,std::ios::binary);
+            if(!input) throw std::runtime_error("missing biome source JSON: "+biomeFile.string());
+            const auto biome=nlohmann::json::parse(input);
+            if(biome.contains("attributes")) {
+                const auto& attributes=biome.at("attributes");
+                if(attributes.contains("minecraft:visual/sky_color"))
+                    parsed.sky=parseSourceRgb(attributes.at("minecraft:visual/sky_color").get<std::string>());
+                if(attributes.contains("minecraft:visual/fog_color"))
+                    parsed.fog=parseSourceRgb(attributes.at("minecraft:visual/fog_color").get<std::string>());
+            }
+        } catch(const std::exception& exception) {
+            lastError_="Could not load source biome sky/fog attributes: "+std::string(exception.what());
+        }
+        colors=biomeVisualColors_.emplace(std::string(visual.biomeId),parsed).first;
+    }
+    const Rgb white{1.0F,1.0F,1.0F};
+    const Rgb sky=multiplyRgb(colors->second.sky,
+        sampleSourceTimelineColor(skyColorTimeline_,dayTimelinePeriod_,visual.dayTime,white));
+    const Rgb fog=multiplyRgb(colors->second.fog,
+        sampleSourceTimelineColor(fogColorTimeline_,dayTimelinePeriod_,visual.dayTime,white));
+    // This is FogRenderer's atmospheric clear-color blend. The Carbon view
+    // currently exposes a two-chunk radius; SkyRenderer's separate sky disc is
+    // drawn below from the source biome SKY_COLOR attribute.
+    const float skyFogEnd=std::min(512.0F/16.0F,static_cast<float>(std::max(0,visual.renderDistanceChunks)));
+    const float skyFogLerp=0.25F+(1.0F-0.25F)*std::clamp(skyFogEnd/32.0F,0.0F,1.0F);
+    const float skyColorMix=1.0F-std::pow(skyFogLerp,0.25F);
+    const Rgb background=lerpRgb(skyColorMix,fog,sky);
+    glViewport(0,0,width_,height_);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    const double aspect=static_cast<double>(width_)/height_;
+    const double nearPlane=0.05,top=nearPlane*std::tan(70.0*3.14159265358979323846/360.0);
+    glFrustum(-top*aspect,top*aspect,-top,top,nearPlane,512.0);
+    // renderMenu installs an opaque black clear color and an orthographic
+    // projection. Set both world-frame inputs explicitly, then restore the
+    // caller's clear color after the clear so this pass has no global leak.
+    GLdouble priorClearColor[4]{};
+    glGetDoublev(GL_COLOR_CLEAR_VALUE,priorClearColor);
+    glClearColor(background[0],background[1],background[2],0.0F);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    glClearColor(static_cast<GLfloat>(priorClearColor[0]),static_cast<GLfloat>(priorClearColor[1]),
+                 static_cast<GLfloat>(priorClearColor[2]),static_cast<GLfloat>(priorClearColor[3]));
+
+    // Source SkyRenderer's top sky disc is a 10-vertex triangle fan at y=16,
+    // radius 512, fixed around the camera and colored from SKY_COLOR.
+    const auto skyView=cameraViewMatrix(player.yaw,player.pitch,{});
+    glMatrixMode(GL_MODELVIEW); glLoadMatrixd(skyView.data());
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);
+    glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE); glColor4f(sky[0],sky[1],sky[2],1.0F);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex3f(0.0F,16.0F,0.0F);
+    for(int degrees=-180;degrees<=180;degrees+=45) {
+        const float angle=static_cast<float>(degrees)*(3.14159265358979323846F/180.0F);
+        glVertex3f(512.0F*std::cos(angle),16.0F,512.0F*std::sin(angle));
+    }
+    glEnd();
+    glDepthMask(GL_TRUE); glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);
+    glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
 
     const auto view = cameraViewMatrix(player.yaw, player.pitch,
         {player.position.x, player.position.y+player.eyeHeight, player.position.z});
@@ -614,6 +916,35 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
         textures_.emplace(id,texture); return true;
     };
 
+    auto bindFluidTexture = [&](FluidMaterial material, FluidTexture frame) {
+        const bool water=material==FluidMaterial::Water;
+        const bool still=frame==FluidTexture::Still;
+        const std::string materialName=water?"water":"lava";
+        const std::string frameName=still?"still":"flow";
+        const std::string key="fluid:"+materialName+"_"+frameName+"#frame0";
+        if(const auto found=textures_.find(key);found!=textures_.end()) {
+            glBindTexture(GL_TEXTURE_2D,found->second); return true;
+        }
+        const auto file=resourceRoot_ / L"assets" / L"minecraft" / L"textures" / L"block" /
+            (std::filesystem::path(materialName+"_"+frameName).concat(L".png"));
+        Image strip;
+        if(!readPng(file,strip)) { lastError_="Could not decode source fluid texture: "+file.string(); return false; }
+        const std::uint32_t frameHeight=strip.width;
+        if(!frameHeight || strip.height<frameHeight || strip.height%frameHeight!=0) {
+            lastError_="Unsupported animated fluid texture frame layout: "+file.string(); return false;
+        }
+        Image first{strip.width,frameHeight,{}};
+        const auto byteCount=static_cast<std::size_t>(strip.width)*frameHeight*4;
+        first.rgba.assign(strip.rgba.begin(),strip.rgba.begin()+static_cast<std::ptrdiff_t>(byteCount));
+        GLuint texture=0; glGenTextures(1,&texture); glBindTexture(GL_TEXTURE_2D,texture);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,static_cast<GLsizei>(first.width),static_cast<GLsizei>(first.height),0,GL_RGBA,GL_UNSIGNED_BYTE,first.rgba.data());
+        textures_.emplace(key,texture); return true;
+    };
+
     const auto blockHash=[](const BlockInstance& block) {
         std::uint64_t h=static_cast<std::uint64_t>(block.block)+1;
         h=mixHash(h,BlockPos::asLong(block.pos.x,block.pos.y,block.pos.z));
@@ -623,6 +954,8 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
         h=mixHash(h,static_cast<std::uint64_t>(block.stairShape));
         const std::uint64_t fenceBits=(block.fenceConnections.north?1ULL:0ULL)|(block.fenceConnections.east?2ULL:0ULL)|(block.fenceConnections.south?4ULL:0ULL)|(block.fenceConnections.west?8ULL:0ULL);
         h=mixHash(h,fenceBits);
+        for(const char c:block.generatedSourceBlockId) h=mixHash(h,static_cast<unsigned char>(c));
+        h=mixHash(h,block.generatedSourceBlockId.size());
         return h;
     };
     std::uint64_t sceneFingerprint=0x434152424f4eULL;
@@ -654,6 +987,13 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
     if (sceneChanged) { stats_.visibleQuads=0; stats_.culledQuads=0; }
     if (sceneChanged) stats_.lastSectionHashMs=stats_.lastMeshPrepareMs=stats_.lastDisplayListBuildMs=0.0;
     auto stateSelector=[](const BlockInstance& block,std::string& state,std::string& selector) {
+        if(!block.generatedSourceBlockId.empty()) {
+            state=std::string(block.generatedSourceBlockId);
+            if(state=="minecraft:grass_block" || state=="minecraft:mycelium" || state=="minecraft:podzol")
+                selector="snowy=false";
+            else if(state=="minecraft:snow") selector="layers=1";
+            return block.block!=BlockId::Air && block.block!=BlockId::Water && block.block!=BlockId::Lava;
+        }
         switch (block.block) {
         case BlockId::Bedrock: state="minecraft:bedrock"; break;
         case BlockId::Dirt: state="minecraft:dirt"; break;
@@ -676,6 +1016,15 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
         }
         return true;
     };
+    auto fluidKindFor=[](BlockId block) {
+        switch(block) {
+        case BlockId::Water:return FluidCellKind::Water;
+        case BlockId::Lava:return FluidCellKind::Lava;
+        case BlockId::StoneSlab:case BlockId::StoneStairs:case BlockId::OakFence:return FluidCellKind::PartialSolid;
+        case BlockId::Air:return FluidCellKind::Air;
+        default:return FluidCellKind::Solid;
+        }
+    };
     auto renderStateHash=[](const BlockInstance& block) {
         std::uint64_t h=static_cast<std::uint64_t>(block.block)+1;
         h=mixHash(h,static_cast<std::uint64_t>(block.slabType));
@@ -683,7 +1032,9 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
         h=mixHash(h,static_cast<std::uint64_t>(block.stairHalf));
         h=mixHash(h,static_cast<std::uint64_t>(block.stairShape));
         const std::uint64_t fenceBits=(block.fenceConnections.north?1ULL:0ULL)|(block.fenceConnections.east?2ULL:0ULL)|(block.fenceConnections.south?4ULL:0ULL)|(block.fenceConnections.west?8ULL:0ULL);
-        return mixHash(h,fenceBits);
+        h=mixHash(h,fenceBits);
+        for(const char c:block.generatedSourceBlockId) h=mixHash(h,static_cast<unsigned char>(c));
+        return mixHash(h,block.generatedSourceBlockId.size());
     };
     std::unordered_map<std::uint64_t,bool> supportFaceCache;
     const auto camera=cameraBasis(player.yaw,player.pitch);
@@ -703,7 +1054,7 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
     std::unordered_map<std::int64_t,int> topOpaqueByColumn;
     topOpaqueByColumn.reserve(blocks.size());
     for (const auto& block:blocks) {
-        if (block.block==BlockId::Air || block.block==BlockId::Water || block.block==BlockId::OakFence) continue;
+        if (block.block==BlockId::Air || block.block==BlockId::Water || block.block==BlockId::Lava || block.block==BlockId::OakFence) continue;
         const auto column=BlockPos::asLong(block.pos.x,0,block.pos.z);
         auto [it,inserted]=topOpaqueByColumn.try_emplace(column,block.pos.y);
         if (!inserted) it->second=std::max(it->second,block.pos.y);
@@ -800,6 +1151,21 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
             }
             glEnd(); glEndList(); mesh.textureLists.emplace(texture,list);
         }
+        for(const auto* block:section.blocks) {
+            if(block->block!=BlockId::Water && block->block!=BlockId::Lava) continue;
+            if(fluidNeighborhoodBounds &&
+               (block->pos.x<=fluidNeighborhoodBounds->minX || block->pos.x>=fluidNeighborhoodBounds->maxX ||
+                block->pos.y<=fluidNeighborhoodBounds->minY || block->pos.y>=fluidNeighborhoodBounds->maxY ||
+                block->pos.z<=fluidNeighborhoodBounds->minZ || block->pos.z>=fluidNeighborhoodBounds->maxZ)) continue;
+            FluidNeighborhood neighborhood{};
+            for(int dy=-1;dy<=1;++dy) for(int dz=-1;dz<=1;++dz) for(int dx=-1;dx<=1;++dx) {
+                const auto neighbor=blockLookup.find(BlockPos::asLong(block->pos.x+dx,block->pos.y+dy,block->pos.z+dz));
+                fluidCellAt(neighborhood,dx,dy,dz).kind=neighbor==blockLookup.end()?FluidCellKind::Air:fluidKindFor(neighbor->second.block->block);
+            }
+            auto quads=buildFluidQuads(neighborhood);
+            stats_.visibleQuads+=quads.size();
+            for(auto& quad:quads) mesh.fluidQuads.push_back({block->pos.x,block->pos.y,block->pos.z,std::move(quad)});
+        }
         stats_.lastDisplayListBuildMs+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-listBuildStart).count();
         sectionMeshes_.emplace(sectionKey,std::move(mesh)); ++stats_.meshBuilds;
     }
@@ -829,12 +1195,66 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
             glCallList(list); ++stats_.drawCalls;
         }
     }
+    struct FluidDraw { const CachedFluidQuad* cached{}; double depth{}; };
+    std::vector<FluidDraw> fluidDraws;
+    for(const auto& [sectionKey,mesh]:sectionMeshes_) {
+        (void)sectionKey;
+        const Vec3 sectionCenter{mesh.x*16.0+8.0,mesh.y*16.0+8.0,mesh.z*16.0+8.0};
+        const Vec3 sectionDelta=sectionCenter.subtract(eye); const double sectionRadius=13.86;
+        const double sectionDepth=sectionDelta.x*camera.forward.x+sectionDelta.y*camera.forward.y+sectionDelta.z*camera.forward.z;
+        const double sectionHorizontal=sectionDelta.x*camera.right.x+sectionDelta.y*camera.right.y+sectionDelta.z*camera.right.z;
+        const double sectionVertical=sectionDelta.x*camera.up.x+sectionDelta.y*camera.up.y+sectionDelta.z*camera.up.z;
+        if(sectionDepth+sectionRadius<0.05 || sectionDepth-sectionRadius>512.0 ||
+           std::abs(sectionHorizontal)>std::max(0.0,sectionDepth)*tanH+sectionRadius*1.42 ||
+           std::abs(sectionVertical)>std::max(0.0,sectionDepth)*tanV+sectionRadius*1.42) continue;
+        for(const auto& cached:mesh.fluidQuads) {
+            double centerY=0.0;
+            for(const auto& vertex:cached.quad.vertices) centerY+=vertex.y*0.25;
+            const Vec3 delta{cached.x+0.5-eye.x,cached.y+centerY-eye.y,cached.z+0.5-eye.z};
+            const double depth=delta.x*camera.forward.x+delta.y*camera.forward.y+delta.z*camera.forward.z;
+            fluidDraws.push_back({&cached,depth});
+        }
+    }
+    std::sort(fluidDraws.begin(),fluidDraws.end(),[](const FluidDraw& a,const FluidDraw& b){return a.depth>b.depth;});
+    if(!fluidDraws.empty()) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        bool quadOpen=false;
+        FluidMaterial currentMaterial{};
+        FluidTexture currentTexture{};
+        for(const auto& draw:fluidDraws) {
+            const auto& quad=draw.cached->quad;
+            if(!quadOpen || quad.material!=currentMaterial || quad.texture!=currentTexture) {
+                if(quadOpen) { glEnd(); ++stats_.drawCalls; }
+                if(!bindFluidTexture(quad.material,quad.texture)) { quadOpen=false; continue; }
+                currentMaterial=quad.material; currentTexture=quad.texture;
+                const bool water=currentMaterial==FluidMaterial::Water;
+                glColor4f(water?63.0f/255.0f:1.0f,water?118.0f/255.0f:1.0f,water?228.0f/255.0f:1.0f,1.0f);
+                glBegin(GL_QUADS); quadOpen=true;
+            }
+            const float ox=static_cast<float>(draw.cached->x),oy=static_cast<float>(draw.cached->y),oz=static_cast<float>(draw.cached->z);
+            for(const auto& vertex:quad.vertices) {
+                glTexCoord2f(vertex.u,vertex.v);
+                glVertex3f(ox+vertex.x,oy+vertex.y,oz+vertex.z);
+            }
+        }
+        if(quadOpen) { glEnd(); ++stats_.drawCalls; }
+        glDepthMask(GL_TRUE);
+        glColor4f(1,1,1,1);
+        if(!blendWasEnabled) glDisable(GL_BLEND);
+    }
     stats_.lastWorldDrawMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-worldDrawStart).count();
 
     // Original HUD sprite textures from the supplied resource pack.
+    // The world pass needs depth testing enabled even if a caller entered
+    // from a 2D menu, but restore that incoming state before HUD setup.
+    if(depthWasEnabledBeforeFrame) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     const GLboolean depthWasEnabled=glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean hudBlendWasEnabled=glIsEnabled(GL_BLEND);
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0,width_,height_,0,-1,1);
     glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity(); glDisable(GL_DEPTH_TEST);
+    glEnable(GL_TEXTURE_2D); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     const auto hudTexture=[&](std::string_view name,float x,float y,float w,float h) {
         if (!bind("gui/sprites/hud",name)) return;
         glColor4f(1,1,1,1); glBegin(GL_QUADS);
@@ -845,7 +1265,7 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
     const int hotbarGuiScale=sourceAutoGuiScale(width_,height_);
     const auto hotbarLayout=sourceHotbarLayout(width_,height_,hotbarGuiScale,slot);
     const float itemScale=static_cast<float>(hotbarGuiScale);
-    const float scale=std::max(1.0f,std::min(width_/320.0f,height_/180.0f));
+    const float scale=static_cast<float>(hotbarGuiScale);
     hudTexture("hotbar",static_cast<float>(hotbarLayout.background.x),
                static_cast<float>(hotbarLayout.background.y),
                static_cast<float>(hotbarLayout.background.width),
@@ -922,10 +1342,11 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
             const unsigned char code=(raw>=32 && raw<128) ? raw : static_cast<unsigned char>('?');
             const float glyphWidth=static_cast<float>(glyphWidths_[code])*scale;
             if (code!=' ' && glyphWidth>0) {
-                const float u0=static_cast<float>((code%16)*8)/128.0f;
-                const float v0=static_cast<float>((code/16)*8)/128.0f;
-                const float u1=u0+static_cast<float>(glyphWidths_[code])/128.0f;
-                const float v1=v0+8.0f/128.0f;
+                const int cellX=(code%16)*fontGlyphCellWidth_, cellY=(code/16)*fontGlyphCellHeight_;
+                const float u0=static_cast<float>(cellX)/fontAtlasWidth_;
+                const float v0=static_cast<float>(cellY)/fontAtlasHeight_;
+                const float u1=static_cast<float>(cellX+glyphWidths_[code])/fontAtlasWidth_;
+                const float v1=static_cast<float>(cellY+fontGlyphCellHeight_)/fontAtlasHeight_;
                 glBegin(GL_QUADS);
                 glTexCoord2f(u0,v0); glVertex2f(textX,textY);
                 glTexCoord2f(u1,v0); glVertex2f(textX+glyphWidth,textY);
@@ -933,10 +1354,11 @@ void ClientRenderer::render(std::span<const BlockInstance> blocks, const PlayerS
                 glTexCoord2f(u0,v1); glVertex2f(textX,textY+glyphHeight);
                 glEnd();
             }
-            textX+=glyphWidth;
+            textX+=glyphAdvances_[code]*scale;
         }
     }
     if(depthWasEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if(hudBlendWasEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
     glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
     const GLenum glError=glGetError();
     if (glError!=GL_NO_ERROR && !loggedGlFailure_) {
@@ -971,9 +1393,33 @@ void ClientRenderer::renderMenu(std::string_view title, std::span<const MenuButt
         if(found!=textures_.end()) { glBindTexture(GL_TEXTURE_2D,found->second); return true; }
         const auto colon=id.find(':');
         if(colon==std::string::npos) return false;
-        const auto file=resourceRoot_ / L"assets" / std::filesystem::path(id.substr(0,colon)) / L"textures" /
+        const auto sourceFile=resourceRoot_ / L"assets" / std::filesystem::path(id.substr(0,colon)) / L"textures" /
             std::filesystem::path(id.substr(colon+1)).concat(L".png");
-        Image image; if(!readPng(file,image)) { lastError_="Could not decode menu texture: "+file.string(); return false; }
+        Image image;
+        const bool sourceLoaded=readPng(sourceFile,image);
+        // Preserve an explicitly supplied source/resource-pack texture. The
+        // 1x1 files in the supplied jar are sentinel placeholders; when the
+        // verified matching asset index has the full panorama, use that data.
+        if(sourceLoaded && (image.width!=1 || image.height!=1)) {
+            // Keep the source tree's image as the selected override.
+        } else {
+        const std::string indexedName=id.substr(0,colon)+"/textures/"+id.substr(colon+1)+".png";
+        std::filesystem::path file;
+        if(!indexedAssetObjectsRoot_.empty()) {
+            if(const auto asset=indexedAssetHashes_.find(indexedName);asset!=indexedAssetHashes_.end()) {
+                std::string safeHash;
+                if(normalizeSha1(asset->second,safeHash)) {
+                    const auto object=indexedAssetObjectsRoot_/safeHash.substr(0,2)/safeHash;
+                    const auto actualHash=hashFile(object,BCRYPT_SHA1_ALGORITHM);
+                    if(actualHash && *actualHash==safeHash) file=object;
+                }
+            }
+        }
+        if(!file.empty() && !readPng(file,image)) image={};
+        if(!sourceLoaded && image.width==0 && !readPng(sourceFile,image)) {
+            lastError_="Could not decode menu texture: "+sourceFile.string(); return false;
+        }
+        }
         GLuint texture=0; glGenTextures(1,&texture); glBindTexture(GL_TEXTURE_2D,texture);
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
@@ -991,7 +1437,40 @@ void ClientRenderer::renderMenu(std::string_view title, std::span<const MenuButt
         glTexCoord2f(0,1); glVertex2f(static_cast<float>(x),static_cast<float>(y+h));
         glEnd();
     };
-    const int uiScale = std::max(1, std::min(width_ / 320, height_ / 180));
+    auto drawButton = [&](std::string_view id, int x, int y, int w, int h) {
+        if (!menuBind(id)) return;
+        // The source widget sprites are nine-sliced with a three-pixel border.
+        // Keep that border crisp at the active integer GUI scale.
+        const int border=std::min({3*sourceAutoGuiScale(width_,height_),w/2,h/2});
+        const float uvBorderX=3.0f/200.0f, uvBorderY=3.0f/20.0f;
+        const std::array<int,4> xs{x,x+border,x+w-border,x+w};
+        const std::array<int,4> ys{y,y+border,y+h-border,y+h};
+        const std::array<float,4> us{0.0f,uvBorderX,1.0f-uvBorderX,1.0f};
+        const std::array<float,4> vs{0.0f,uvBorderY,1.0f-uvBorderY,1.0f};
+        glColor4f(1,1,1,1);
+        for(int row=0;row<3;++row) for(int column=0;column<3;++column) {
+            glBegin(GL_QUADS);
+            glTexCoord2f(us[column],vs[row]); glVertex2f(static_cast<float>(xs[column]),static_cast<float>(ys[row]));
+            glTexCoord2f(us[column+1],vs[row]); glVertex2f(static_cast<float>(xs[column+1]),static_cast<float>(ys[row]));
+            glTexCoord2f(us[column+1],vs[row+1]); glVertex2f(static_cast<float>(xs[column+1]),static_cast<float>(ys[row+1]));
+            glTexCoord2f(us[column],vs[row+1]); glVertex2f(static_cast<float>(xs[column]),static_cast<float>(ys[row+1]));
+            glEnd();
+        }
+    };
+    auto drawTiledTexture = [&](std::string_view id, int tileSize) {
+        if (!menuBind(id)) return;
+        glColor4f(1,1,1,1);
+        for(int y=0;y<height_;y+=tileSize) for(int x=0;x<width_;x+=tileSize) {
+            const int tileW=std::min(tileSize,width_-x), tileH=std::min(tileSize,height_-y);
+            glBegin(GL_QUADS);
+            glTexCoord2f(0,0); glVertex2f(static_cast<float>(x),static_cast<float>(y));
+            glTexCoord2f(static_cast<float>(tileW)/tileSize,0); glVertex2f(static_cast<float>(x+tileW),static_cast<float>(y));
+            glTexCoord2f(static_cast<float>(tileW)/tileSize,static_cast<float>(tileH)/tileSize); glVertex2f(static_cast<float>(x+tileW),static_cast<float>(y+tileH));
+            glTexCoord2f(0,static_cast<float>(tileH)/tileSize); glVertex2f(static_cast<float>(x),static_cast<float>(y+tileH));
+            glEnd();
+        }
+    };
+    const int uiScale = sourceAutoGuiScale(width_,height_);
     if (titleScreen) {
         // The supplied CubeMapTexture uses CubeMap's face order and a view
         // looking into an animated six-sided panorama. Render the same six
@@ -999,7 +1478,7 @@ void ClientRenderer::renderMenu(std::string_view title, std::span<const MenuButt
         glMatrixMode(GL_PROJECTION); glLoadIdentity();
         const double nearPlane=0.05, top=nearPlane*std::tan(85.0*3.14159265358979323846/360.0), aspect=static_cast<double>(width_)/height_;
         glFrustum(-top*aspect,top*aspect,-top,top,nearPlane,10.0);
-        glMatrixMode(GL_MODELVIEW); glLoadIdentity(); glRotatef(180.0f,1,0,0); glRotatef(panoramaRotation_,0,1,0);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity(); glRotatef(180.0f,1,0,0); glRotatef(-panoramaRotation_,0,1,0);
         glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);
         struct Face { const char* image; std::array<std::array<float,3>,4> p; };
         const std::array<Face,6> faces{{
@@ -1019,60 +1498,101 @@ void ClientRenderer::renderMenu(std::string_view title, std::span<const MenuButt
         }
         glLoadIdentity(); glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0,width_,height_,0,-1,1); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
         glDisable(GL_DEPTH_TEST);
-        panoramaRotation_+=0.012f; if(panoramaRotation_>360.0f) panoramaRotation_-=360.0f;
-        drawTexture("minecraft:gui/title/background/panorama_overlay", 0, 0, width_, height_, 0.72f);
-        const int logoX=(width_-256*uiScale)/2, logoY=30*uiScale;
+        // Panorama.extractRenderState advances by 0.1 degrees per realtime tick.
+        const auto now=std::chrono::steady_clock::now();
+        if(panoramaLastFrame_.time_since_epoch().count()!=0) {
+            const float elapsed=std::chrono::duration<float>(now-panoramaLastFrame_).count();
+            panoramaRotation_=std::remainder(panoramaRotation_+elapsed*2.0f,360.0f);
+        }
+        panoramaLastFrame_=now;
+        drawTexture("minecraft:gui/title/background/panorama_overlay", 0, 0, width_, height_);
+        constexpr float logoSourceWidth=256.0f, logoSourceHeight=44.0f;
+        constexpr float logoTextureWidth=256.0f, logoTextureHeight=64.0f;
+        constexpr float editionSourceWidth=128.0f, editionSourceHeight=14.0f;
+        constexpr float editionTextureWidth=128.0f, editionTextureHeight=16.0f;
+        const int logoX=(width_-static_cast<int>(logoSourceWidth)*uiScale)/2, logoY=30*uiScale;
         if(menuBind("minecraft:gui/title/minecraft")) {
+            // LogoRenderer passes virtual source dimensions 256x64 to blit.
+            // The checked 1024x256 file is the high-resolution form of that
+            // image, so the source UV spans its full width and 44/64 height.
             glColor4f(1,1,1,1); glBegin(GL_QUADS);
             glTexCoord2f(0,0);glVertex2f(static_cast<float>(logoX),static_cast<float>(logoY));
-            glTexCoord2f(1,0);glVertex2f(static_cast<float>(logoX+256*uiScale),static_cast<float>(logoY));
-            glTexCoord2f(1,44.0f/64.0f);glVertex2f(static_cast<float>(logoX+256*uiScale),static_cast<float>(logoY+44*uiScale));
-            glTexCoord2f(0,44.0f/64.0f);glVertex2f(static_cast<float>(logoX),static_cast<float>(logoY+44*uiScale)); glEnd();
+            glTexCoord2f(logoSourceWidth/logoTextureWidth,0);glVertex2f(static_cast<float>(logoX+logoSourceWidth*uiScale),static_cast<float>(logoY));
+            glTexCoord2f(logoSourceWidth/logoTextureWidth,logoSourceHeight/logoTextureHeight);glVertex2f(static_cast<float>(logoX+logoSourceWidth*uiScale),static_cast<float>(logoY+logoSourceHeight*uiScale));
+            glTexCoord2f(0,logoSourceHeight/logoTextureHeight);glVertex2f(static_cast<float>(logoX),static_cast<float>(logoY+logoSourceHeight*uiScale)); glEnd();
         }
-        const int editionX=(width_-128*uiScale)/2, editionY=logoY+37*uiScale;
+        const int editionX=(width_-static_cast<int>(editionSourceWidth)*uiScale)/2, editionY=logoY+37*uiScale;
         if(menuBind("minecraft:gui/title/edition")) {
             glColor4f(1,1,1,1); glBegin(GL_QUADS);
             glTexCoord2f(0,0);glVertex2f(static_cast<float>(editionX),static_cast<float>(editionY));
-            glTexCoord2f(1,0);glVertex2f(static_cast<float>(editionX+128*uiScale),static_cast<float>(editionY));
-            glTexCoord2f(1,14.0f/16.0f);glVertex2f(static_cast<float>(editionX+128*uiScale),static_cast<float>(editionY+14*uiScale));
-            glTexCoord2f(0,14.0f/16.0f);glVertex2f(static_cast<float>(editionX),static_cast<float>(editionY+14*uiScale)); glEnd();
+            glTexCoord2f(editionSourceWidth/editionTextureWidth,0);glVertex2f(static_cast<float>(editionX+editionSourceWidth*uiScale),static_cast<float>(editionY));
+            glTexCoord2f(editionSourceWidth/editionTextureWidth,editionSourceHeight/editionTextureHeight);glVertex2f(static_cast<float>(editionX+editionSourceWidth*uiScale),static_cast<float>(editionY+editionSourceHeight*uiScale));
+            glTexCoord2f(0,editionSourceHeight/editionTextureHeight);glVertex2f(static_cast<float>(editionX),static_cast<float>(editionY+editionSourceHeight*uiScale)); glEnd();
         }
     } else {
-        drawTexture("minecraft:gui/menu_background", 0, 0, width_, height_);
-        glDisable(GL_TEXTURE_2D);
-        glColor4f(0,0,0,0.58f); glBegin(GL_QUADS);
-        glVertex2f(0,0); glVertex2f(static_cast<float>(width_),0);
-        glVertex2f(static_cast<float>(width_),static_cast<float>(height_)); glVertex2f(0,static_cast<float>(height_)); glEnd();
-        glEnable(GL_TEXTURE_2D);
+        drawTiledTexture("minecraft:gui/menu_background",16*uiScale);
     }
-    auto drawText = [&](std::string_view text, float x, float y, float scale, bool centered) {
+    auto drawText = [&](std::string_view text, float x, float y, float scale, bool centered, bool gold = false) {
         if (!menuBind("minecraft:font/ascii")) return;
         float total=0;
-        for (const unsigned char c:text) total += glyphWidths_[(c>=32&&c<128)?c:'?']*scale;
+        for (const unsigned char c:text) total += glyphAdvances_[(c>=32&&c<128)?c:'?']*scale;
         if (centered) x-=total*0.5f;
-        glColor4f(1,1,1,1);
+        glColor4f(gold?1.0f:1.0f,gold?0.84f:1.0f,gold?0.0f:1.0f,1);
         for (const unsigned char raw:text) {
             const unsigned char c=(raw>=32&&raw<128)?raw:static_cast<unsigned char>('?');
             const float gw=static_cast<float>(glyphWidths_[c])*scale;
             if (c!=' '&&gw>0) {
-                const float u0=static_cast<float>((c%16)*8)/128.0f, v0=static_cast<float>((c/16)*8)/128.0f;
-                const float u1=u0+static_cast<float>(glyphWidths_[c])/128.0f, v1=v0+8.0f/128.0f;
+                const int cellX=(c%16)*fontGlyphCellWidth_, cellY=(c/16)*fontGlyphCellHeight_;
+                const float u0=static_cast<float>(cellX)/fontAtlasWidth_, v0=static_cast<float>(cellY)/fontAtlasHeight_;
+                const float u1=static_cast<float>(cellX+glyphWidths_[c])/fontAtlasWidth_;
+                const float v1=static_cast<float>(cellY+fontGlyphCellHeight_)/fontAtlasHeight_;
                 glBegin(GL_QUADS);
                 glTexCoord2f(u0,v0); glVertex2f(x,y); glTexCoord2f(u1,v0); glVertex2f(x+gw,y);
-                glTexCoord2f(u1,v1); glVertex2f(x+gw,y+8*scale); glTexCoord2f(u0,v1); glVertex2f(x,y+8*scale);
+                glTexCoord2f(u1,v1); glVertex2f(x+gw,y+fontGlyphCellHeight_*scale); glTexCoord2f(u0,v1); glVertex2f(x,y+fontGlyphCellHeight_*scale);
                 glEnd();
             }
-            x+=gw;
+            x+=glyphAdvances_[c]*scale;
         }
     };
-    if (!titleScreen) drawText(title, width_*0.5f, 12.0f*uiScale, 2.0f*uiScale, true);
+    if(titleScreen) {
+        if(titleSplash_.empty()) {
+            std::ifstream input(resourceRoot_/L"assets"/L"minecraft"/L"texts"/L"splashes.txt");
+            std::vector<std::string> splashes;
+            std::string line;
+            while(std::getline(input,line)) {
+                if(!line.empty() && line.back()=='\r') line.pop_back();
+                if(line.empty()) continue;
+                std::uint32_t hash=0;
+                for(unsigned char character:line) hash=hash*31u+character;
+                if(hash!=125780783u) splashes.push_back(line);
+            }
+            if(!splashes.empty()) titleSplash_=splashes[GetTickCount64()%splashes.size()];
+        }
+        if(!titleSplash_.empty()) {
+            const auto now=std::chrono::steady_clock::now().time_since_epoch();
+            const float phase=static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count()%1000)*0.0062831853f;
+            const float textWidth=[&] { float total=0; for(unsigned char c:titleSplash_) total+=glyphAdvances_[(c>=32&&c<128)?c:'?']; return total; }();
+            const float pulse=1.8f-std::abs(std::sin(phase))*0.1f;
+            const float splashScale=pulse*100.0f/(textWidth+32.0f)*uiScale;
+            glPushMatrix();
+            glTranslatef(width_*0.5f+123.0f*uiScale,69.0f*uiScale,0);
+            glRotatef(-20.0f,0,0,1);
+            drawText(titleSplash_,0,-8.0f*splashScale,splashScale,true,true);
+            glPopMatrix();
+        }
+        const std::string editionText="Minecraft 26.3";
+        drawText(editionText,2.0f*uiScale,height_-10.0f*uiScale,static_cast<float>(uiScale),false);
+        const std::string copyright="Copyright Mojang AB. Do not distribute!";
+        float copyrightWidth=0; for(unsigned char c:copyright) copyrightWidth+=glyphAdvances_[(c>=32&&c<128)?c:'?']*uiScale;
+        drawText(copyright,width_-2.0f*uiScale-copyrightWidth,height_-10.0f*uiScale,static_cast<float>(uiScale),false);
+    } else drawText(title, width_*0.5f, 12.0f*uiScale, 2.0f*uiScale, true);
     for (const auto& b:buttons) {
         const std::string_view sprite = b.disabled ? "minecraft:gui/sprites/widget/button_disabled" :
             (b.hovered ? "minecraft:gui/sprites/widget/button_highlighted" : "minecraft:gui/sprites/widget/button");
-        drawTexture(sprite, b.x, b.y, b.width, b.height);
+        drawButton(sprite, b.x, b.y, b.width, b.height);
         drawText(b.label, b.x+b.width*0.5f, b.y+(b.height-8*uiScale)*0.5f, static_cast<float>(uiScale), true);
     }
-    if (!subtitle.empty()) drawText(subtitle, width_*0.5f, height_-24.0f*uiScale, static_cast<float>(uiScale), true);
+    if (!subtitle.empty()) drawText(subtitle, width_*0.5f, height_-72.0f*uiScale, static_cast<float>(uiScale), true);
     glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST);
     const GLenum glError=glGetError();
     if(glError!=GL_NO_ERROR) lastError_="OpenGL menu rendering error";
@@ -1127,6 +1647,7 @@ void ClientRenderer::shutdown() {
     guiItemModels_.clear();
     resourceRoot_.clear();
     textureRoot_.clear();
+    indexedAssetObjectsRoot_.clear(); indexedAssetHashes_.clear();
 }
 
 } // namespace carbon

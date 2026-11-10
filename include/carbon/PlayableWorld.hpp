@@ -6,11 +6,13 @@
 #include "carbon/Vec3.hpp"
 
 #include <optional>
+#include <memory>
+#include <string_view>
 #include <vector>
 
 namespace carbon {
 
-enum class BlockId { Air, Bedrock, Dirt, GrassBlock, Stone, Water, StoneSlab, StoneStairs, OakFence };
+enum class BlockId { Air, Bedrock, Dirt, GrassBlock, Stone, Water, Lava, StoneSlab, StoneStairs, OakFence };
 enum class SlabType { Top, Bottom, Double };
 enum class StairHalf { Bottom, Top };
 enum class StairsShape { Straight, InnerLeft, InnerRight, OuterLeft, OuterRight };
@@ -29,6 +31,7 @@ struct BlockInstance {
     StairHalf stairHalf{StairHalf::Bottom};
     StairsShape stairShape{StairsShape::Straight};
     FenceConnections fenceConnections{};
+    std::string_view generatedSourceBlockId{};
 };
 struct PlayerState {
     Vec3 position{0.5, -60.0, 0.5}; // feet position, at the CLASSIC_FLAT spawn height
@@ -59,6 +62,9 @@ public:
 
     PlayableWorld();
     static PlayableWorld createDefaultFlat();
+    static PlayableWorld createSeededOverworld(std::shared_ptr<const class SeededOverworldChunkProvider> terrain);
+    bool hasSeededTerrain() const noexcept { return static_cast<bool>(seededTerrain_); }
+    std::shared_ptr<const class SeededOverworldChunkProvider> seededTerrainProvider() const noexcept { return seededTerrain_; }
 
     PlayerState player;
     BlockId getBlock(const BlockPos& pos) const;
@@ -89,6 +95,7 @@ public:
 
 private:
     std::vector<BlockInstance> blocks_;
+    std::shared_ptr<const class SeededOverworldChunkProvider> seededTerrain_;
     Vec3 velocity_{};
     bool previousJump_{};
     int flightTapTicks_{};

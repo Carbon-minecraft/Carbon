@@ -3,6 +3,7 @@
 #include "carbon/FenceBlock.hpp"
 #include "carbon/SlabBlock.hpp"
 #include "carbon/StairsBlock.hpp"
+#include "carbon/SeededOverworldChunkProvider.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,7 +13,20 @@
 namespace carbon {
 namespace {
 int floorBlock(double v) { return static_cast<int>(std::floor(v)); }
-bool solid(BlockId id) { return id != BlockId::Air; }
+bool solid(BlockId id) { return id != BlockId::Air && id != BlockId::Water && id != BlockId::Lava; }
+BlockId fromGeneratedBlock(GeneratedBlock block) {
+    switch (block) {
+    case GeneratedBlock::Air: return BlockId::Air;
+    case GeneratedBlock::Bedrock: return BlockId::Bedrock;
+    case GeneratedBlock::Dirt: return BlockId::Dirt;
+    case GeneratedBlock::GrassBlock: return BlockId::GrassBlock;
+    case GeneratedBlock::Stone: return BlockId::Stone;
+    case GeneratedBlock::Water: return BlockId::Water;
+    case GeneratedBlock::Lava: return BlockId::Lava;
+    case GeneratedBlock::OtherSolid: return BlockId::Stone;
+    }
+    throw std::runtime_error("seeded terrain returned an unknown generated material");
+}
 VoxelShape outlineBlockShape(BlockId id, SlabType type, Direction facing = Direction::North,
                               StairHalf half = StairHalf::Bottom, StairsShape shape = StairsShape::Straight,
                               FenceConnections fence = {}) {
@@ -25,6 +39,7 @@ VoxelShape collisionBlockShape(BlockId id, SlabType type, Direction facing = Dir
                                StairHalf half = StairHalf::Bottom, StairsShape shape = StairsShape::Straight,
                                FenceConnections fence = {}) {
     if (id == BlockId::OakFence) return fenceCollisionShape(fence);
+    if (id == BlockId::Water || id == BlockId::Lava) return Shapes::empty();
     return outlineBlockShape(id, type, facing, half, shape, fence);
 }
 Direction hitFace(const AABB& box, const Vec3& p) {
@@ -87,8 +102,20 @@ PlayableWorld PlayableWorld::createDefaultFlat() {
     return world;
 }
 
+PlayableWorld PlayableWorld::createSeededOverworld(std::shared_ptr<const SeededOverworldChunkProvider> terrain) {
+    if (!terrain) throw std::invalid_argument("seeded overworld requires a terrain provider");
+    PlayableWorld world;
+    world.seededTerrain_ = std::move(terrain);
+    const auto spawn = world.seededTerrain_->safeSpawn();
+    world.player = PlayerState{};
+    world.player.position = {spawn.x + 0.5, static_cast<double>(spawn.y), spawn.z + 0.5};
+    world.player.onGround = false;
+    return world;
+}
+
 BlockId PlayableWorld::getBlock(const BlockPos& pos) const {
     for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it) if (it->pos == pos) return it->block;
+    if (seededTerrain_) return fromGeneratedBlock(seededTerrain_->getBlock(pos.x,pos.y,pos.z));
     if (pos.y == -64) return BlockId::Bedrock;
     if (pos.y == -63 || pos.y == -62) return BlockId::Dirt;
     if (pos.y == -61) return BlockId::GrassBlock;
@@ -212,18 +239,23 @@ std::vector<BlockInstance> PlayableWorld::blocksInRange(const BlockPos& center, 
     std::unordered_map<std::int64_t,const BlockInstance*> overrides;
     overrides.reserve(blocks_.size());
     for (const auto& block:blocks_) overrides.insert_or_assign(block.pos.asLong(),&block);
+    const int terrainMin=seededTerrain_?SeededOverworldChunk::MIN_Y:-64;
+    const int terrainMax=seededTerrain_?SeededOverworldChunk::MIN_Y+SeededOverworldChunk::HEIGHT-1:-61;
     for (int x=center.x-r; x<=center.x+r; ++x) for (int z=center.z-r; z<=center.z+r; ++z)
-        for (int y=std::max(center.y-r,-64); y<=std::min(center.y+r,-61); ++y) {
-        BlockPos p{x,y,z};
-        const auto found=overrides.find(p.asLong());
-        if (found!=overrides.end()) {
-            if (found->second->block!=BlockId::Air) result.push_back(*found->second);
-        } else {
-            const BlockId block=y==-64?BlockId::Bedrock:y==-61?BlockId::GrassBlock:BlockId::Dirt;
-            result.push_back({p,block});
+        for (int y=std::max(center.y-r,terrainMin); y<=std::min(center.y+r,terrainMax); ++y) {
+            BlockPos p{x,y,z};
+            const auto found=overrides.find(p.asLong());
+            const BlockId block=found!=overrides.end()?found->second->block:getBlock(p);
+            if(block!=BlockId::Air) {
+                if(found!=overrides.end()) result.push_back(*found->second);
+                else {
+                    BlockInstance instance{p,block};
+                    if(seededTerrain_) instance.generatedSourceBlockId=seededTerrain_->sourceIdAt(p.x,p.y,p.z);
+                    result.push_back(instance);
+                }
+            }
         }
-        }
-    for (const auto& block : blocks_) if (block.block != BlockId::Air && (block.pos.y < -64 || block.pos.y > -61) &&
+    for (const auto& block : blocks_) if (block.block != BlockId::Air && (block.pos.y < terrainMin || block.pos.y > terrainMax) &&
         std::abs(block.pos.x-center.x)<=r && std::abs(block.pos.y-center.y)<=r && std::abs(block.pos.z-center.z)<=r)
         result.push_back(block);
     return result;
@@ -243,19 +275,43 @@ std::vector<BlockInstance> PlayableWorld::blocksInSectionWindow(const BlockPos& 
     std::unordered_map<std::int64_t,const BlockInstance*> overrides;
     overrides.reserve(blocks_.size());
     for (const auto& block:blocks_) overrides.insert_or_assign(block.pos.asLong(),&block);
-    for (int x=minX;x<=maxX;++x) for (int z=minZ;z<=maxZ;++z)
-        for (int y=std::max(minY,-64);y<=std::min(maxY,-61);++y) {
-            const BlockPos pos{x,y,z};
-            const auto found=overrides.find(pos.asLong());
-            if (found!=overrides.end()) {
-                if (found->second->block!=BlockId::Air) result.push_back(*found->second);
-            } else {
-                const BlockId block=y==-64?BlockId::Bedrock:y==-61?BlockId::GrassBlock:BlockId::Dirt;
-                result.push_back({pos,block});
+    const int terrainMin=seededTerrain_?SeededOverworldChunk::MIN_Y:-64;
+    const int terrainMax=seededTerrain_?SeededOverworldChunk::MIN_Y+SeededOverworldChunk::HEIGHT-1:-61;
+    const int renderMinY=std::max(minY,terrainMin),renderMaxY=std::min(maxY,terrainMax);
+    if(seededTerrain_ && renderMinY<=renderMaxY) {
+        const auto chunkCoord=[](int value) { return value>=0?value/16:-((15-value)/16); };
+        for(int cx=chunkCoord(minX);cx<=chunkCoord(maxX);++cx) for(int cz=chunkCoord(minZ);cz<=chunkCoord(maxZ);++cz) {
+            const auto& chunk=seededTerrain_->chunk(cx,cz);
+            const int x0=std::max(minX,cx*16),x1=std::min(maxX,cx*16+15);
+            const int z0=std::max(minZ,cz*16),z1=std::min(maxZ,cz*16+15);
+            for(int x=x0;x<=x1;++x) for(int z=z0;z<=z1;++z) {
+                const auto column=chunk.column(x-cx*16,z-cz*16);
+                for(int y=renderMinY;y<=renderMaxY;++y) {
+                    const BlockPos pos{x,y,z};
+                    const auto found=overrides.find(pos.asLong());
+                    const BlockId block=found!=overrides.end()?found->second->block:fromGeneratedBlock(column[static_cast<std::size_t>(y-SeededOverworldChunk::MIN_Y)]);
+                    if(block!=BlockId::Air) {
+                        if(found!=overrides.end()) result.push_back(*found->second);
+                        else {
+                            BlockInstance instance{pos,block};
+                            instance.generatedSourceBlockId=chunk.sourceIdAt(x-cx*16,y,z-cz*16);
+                            result.push_back(instance);
+                        }
+                    }
+                }
             }
         }
+    } else if(renderMinY<=renderMaxY) {
+        for (int x=minX;x<=maxX;++x) for (int z=minZ;z<=maxZ;++z)
+            for (int y=renderMinY;y<=renderMaxY;++y) {
+                const BlockPos pos{x,y,z};
+                const auto found=overrides.find(pos.asLong());
+                const BlockId block=found!=overrides.end()?found->second->block:getBlock(pos);
+                if(block!=BlockId::Air) result.push_back(found!=overrides.end()?*found->second:BlockInstance{pos,block});
+            }
+    }
     for (const auto& block:blocks_) if (block.block!=BlockId::Air &&
-        (block.pos.y < -64 || block.pos.y > -61) && block.pos.x>=minX && block.pos.x<=maxX &&
+        (block.pos.y < terrainMin || block.pos.y > terrainMax) && block.pos.x>=minX && block.pos.x<=maxX &&
         block.pos.z>=minZ && block.pos.z<=maxZ && block.pos.y>=minY && block.pos.y<=maxY)
         result.push_back(block);
     return result;

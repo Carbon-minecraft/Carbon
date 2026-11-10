@@ -4,6 +4,7 @@
 #include "carbon/BlockModels.hpp"
 #include "carbon/CreativeHotbar.hpp"
 #include "carbon/GuiItemRenderer.hpp"
+#include "carbon/SourceFluidRenderer.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -14,17 +15,27 @@
 #include <filesystem>
 #include <array>
 #include <cstdint>
+#include <chrono>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <map>
 #include <memory>
+#include <string_view>
+#include <vector>
 
 namespace carbon {
 
 struct ClientHud {
     CreativeHotbar hotbar;
     std::string status;
+};
+
+// Per-frame environment inputs used by the source 26.3 sky/fog render path.
+struct WorldVisualState {
+    std::string_view biomeId{"minecraft:plains"};
+    std::uint64_t dayTime{};
+    int renderDistanceChunks{2};
 };
 
 struct MenuButton {
@@ -46,6 +57,9 @@ struct RendererStats {
     double lastLightIndexMs{}, lastSectionHashMs{}, lastMeshPrepareMs{}, lastDisplayListBuildMs{}, lastWorldDrawMs{};
     std::string glVendor, glRenderer, glVersion;
 };
+
+struct RenderBlockBounds { int minX{},maxX{},minY{},maxY{},minZ{},maxZ{}; };
+struct CachedFluidQuad { int x{},y{},z{}; FluidQuad quad; };
 
 // A source model face compiled into local block coordinates. UV coordinates
 // remain in Java's 0..16 model texture space until submitted to OpenGL.
@@ -94,7 +108,9 @@ public:
     void resize(int width, int height);
     void render(std::span<const BlockInstance> blocks, const PlayerState& player,
                 const ClientHud& hud = {}, std::uint64_t sceneRevision = 0,
-                std::uint64_t snapshotToken = 0);
+                std::uint64_t snapshotToken = 0,
+                const RenderBlockBounds* fluidNeighborhoodBounds = nullptr,
+                const WorldVisualState* worldVisual = nullptr);
     void renderMenu(std::string_view title, std::span<const MenuButton> buttons,
                     bool titleScreen = false, std::string_view subtitle = {});
     void shutdown();
@@ -113,9 +129,11 @@ private:
     int width_{1}, height_{1};
     std::filesystem::path textureRoot_;
     std::filesystem::path resourceRoot_;
+    std::filesystem::path indexedAssetObjectsRoot_;
+    std::map<std::string,std::string,std::less<>> indexedAssetHashes_;
     std::unordered_map<std::string, unsigned int> textures_;
     std::map<std::string, SourceModelGeometry, std::less<>> sourceModels_;
-    struct SectionMesh { std::uint64_t fingerprint{}; int x{},y{},z{}; std::map<std::string, unsigned int, std::less<>> textureLists; };
+    struct SectionMesh { std::uint64_t fingerprint{}; int x{},y{},z{}; std::map<std::string, unsigned int, std::less<>> textureLists; std::vector<CachedFluidQuad> fluidQuads; };
     std::unordered_map<std::int64_t, SectionMesh> sectionMeshes_;
     std::unique_ptr<class SmoothLightNeighborhood> lightingNeighborhood_;
     std::uint64_t cachedSceneFingerprint_{};
@@ -123,11 +141,22 @@ private:
     RendererStats stats_{};
     std::map<std::string, GuiItemModel, std::less<>> guiItemModels_;
     std::array<std::uint8_t, 128> glyphWidths_{};
+    std::array<float, 128> glyphAdvances_{};
+    int fontAtlasWidth_{128}, fontAtlasHeight_{128};
+    int fontGlyphCellWidth_{8}, fontGlyphCellHeight_{8};
     float grassTintR_{}, grassTintG_{}, grassTintB_{};
     bool loggedContextFailure_{}, loggedSwapFailure_{}, loggedGlFailure_{};
     std::uint64_t presentedFrames_{};
     float panoramaRotation_{};
+    std::chrono::steady_clock::time_point panoramaLastFrame_{};
+    std::string titleSplash_;
     std::string lastError_;
+    struct TimeColorKeyframe { std::int64_t tick{}; std::array<float,3> rgb{}; };
+    struct BiomeVisualColors { std::array<float,3> sky{}; std::array<float,3> fog{}; };
+    std::int64_t dayTimelinePeriod_{24000};
+    std::vector<TimeColorKeyframe> skyColorTimeline_;
+    std::vector<TimeColorKeyframe> fogColorTimeline_;
+    std::map<std::string, BiomeVisualColors, std::less<>> biomeVisualColors_;
 };
 
 } // namespace carbon
