@@ -3,7 +3,7 @@
 #include "carbon/DirectoryResources.hpp"
 #include "carbon/LegacyRandomSource.hpp"
 #include "carbon/PlayableWorld.hpp"
-#include "carbon/ClientRenderer.hpp"
+#include "carbon/SeededOverworldChunkProvider.hpp"
 #include "carbon/Multiplayer.hpp"
 
 #define WIN32_LEAN_AND_MEAN
@@ -11,11 +11,14 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <memory>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -45,20 +48,29 @@ int sectionAnchor(int coordinate) {
 struct ClientApp {
     HWND window{};
     carbon::ClientRenderer renderer;
-    enum class Screen { Title, Worlds, CreateWorld, Multiplayer, Paused, Playing } screen{Screen::Title};
+    enum class Screen { Title, Worlds, CreateWorld, Loading, Multiplayer, Paused, Playing } screen{Screen::Title};
     carbon::PlayableWorld world = carbon::PlayableWorld::createDefaultFlat();
     carbon::MultiplayerClient multiplayer;
     struct Session { std::string name, seedText; std::int64_t seed{}; bool numericSeed{}; };
     std::optional<Session> session;
-    bool flatPresetSelected{};
+    std::optional<Session> pendingSession;
+    std::future<std::shared_ptr<const carbon::SeededOverworldChunkProvider>> terrainLoad;
+    std::shared_ptr<std::atomic<std::size_t>> terrainProgress;
+    std::shared_ptr<std::atomic<int>> terrainLoadStage;
+    std::shared_ptr<std::atomic<bool>> terrainCancel;
+    std::future<void> terrainStream;
+    std::shared_ptr<std::atomic<std::size_t>> terrainStreamProgress;
+    std::shared_ptr<std::atomic<bool>> terrainStreamCancel;
     std::string worldName{"New World"}, seedText, serverAddress{"localhost"}, username{"Player"}, menuMessage;
     int inputField{}; // Create World: 0 name / 1 seed; Multiplayer: 2 address / 3 username
     POINT mouse{};
     std::vector<carbon::BlockInstance> visibleBlocks;
     carbon::BlockPos visibleCenter{std::numeric_limits<int>::min(),0,0};
+    int visibleWindowRadius{-1};
     std::uint64_t visibleRevision{std::numeric_limits<std::uint64_t>::max()};
     std::uint64_t visibleSnapshotToken{};
     carbon::ClientHud hud;
+    std::string_view currentBiome{"minecraft:plains"};
     fs::path sourceRoot;
     bool focused{true};
     bool paused{};
@@ -67,65 +79,79 @@ struct ClientApp {
     carbon::CreativeBreakDelay destroyDelay;
     int rightClickDelay{};
     POINT rawDelta{};
+    std::uint64_t dayTime{};
     std::string error;
 };
 
 ClientApp* appFrom(HWND hwnd) { return reinterpret_cast<ClientApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)); }
 void setCursorCapture(ClientApp& app, bool capture);
 
-int menuScale(int width,int height) { return std::max(1,std::min(width/320,height/180)); }
+int menuScale(int width,int height) { return carbon::sourceAutoGuiScale(width,height); }
 std::vector<carbon::MenuButton> menuButtons(const ClientApp& app,int width,int height) {
-    const int scale=menuScale(width,height), w=200*scale, h=20*scale;
-    const int logicalH=height/scale;
+    const int scale=menuScale(width,height);
+    const int logicalW=width/scale+(width%scale!=0);
+    const int logicalH=height/scale+(height%scale!=0);
     std::vector<carbon::MenuButton> result;
     auto add=[&](std::string label,int lx,int ly,int lw=200,int lh=20,bool disabled=false) {
         carbon::MenuButton button{std::move(label),lx*scale,ly*scale,lw*scale,lh*scale,false,disabled};
-        button.hovered=app.mouse.x>=button.x && app.mouse.x<button.x+button.width && app.mouse.y>=button.y && app.mouse.y<button.y+button.height;
         result.push_back(std::move(button));
     };
     switch(app.screen) {
     case ClientApp::Screen::Title: {
         const int top=logicalH/4+48;
-        add("Singleplayer",0,top); add("Multiplayer",0,top+24);
-        add("Options",-102,top+72,98); add("Quit",4,top+72,98); // replaced with centered pair below
-        result[result.size()-2].x=(width/2-102*scale);
-        result.back().x=(width/2+4*scale);
+        add("Singleplayer",0,top); add("Multiplayer",0,top+24); add("Minecraft Realms",0,top+48,200,20,true);
+        add("Options...",0,top+72,98,20,true); add("Quit Game",0,top+72,98);
+        result[result.size()-2].x=(logicalW/2-102)*scale;
+        result.back().x=(logicalW/2+2)*scale;
         break;
     }
     case ClientApp::Screen::Worlds: {
-        add(app.session ? "Resume: "+app.session->name+" [session only]" : "No saved worlds",0,logicalH/2-40,320,20,!app.session);
-        add("Create New World",0,logicalH/2-12);
-        add("Back",0,logicalH/2+16,200);
+        if(app.session) add(app.session->name+" (current session)",0,logicalH/2-18,300,36);
+        const int rowY=logicalH-54;
+        add("Play Selected World",0,rowY,150,20,!app.session);
+        add("Create New World",0,rowY,150);
+        result[result.size()-2].x=(logicalW/2-154)*scale;
+        result.back().x=(logicalW/2+4)*scale;
+        add("Back",0,logicalH-30,150);
         break;
     }
     case ClientApp::Screen::CreateWorld: {
-        add("World Name: "+app.worldName,0,logicalH/2-76,320);
-        add("Seed: "+(app.seedText.empty()?"(random seed)":app.seedText),0,logicalH/2-48,320);
-        add(std::string("World Type: ")+(app.flatPresetSelected?"Classic Flat (seed does not change terrain)":"Normal (generation unavailable)"),0,logicalH/2-20,320);
-        add("Game Mode: Creative",0,logicalH/2+8,220,20,true);
-        add("Generate Structures: Off",0,logicalH/2+36,220,20,true);
-        add("Create World",0,logicalH/2+64,200,20,!app.flatPresetSelected);
-        add("Cancel",0,logicalH/2+92);
+        const int top=48;
+        add("World Name: "+app.worldName,0,top,320);
+        add("Seed: "+(app.seedText.empty()?"(random seed)":app.seedText),0,top+24,320);
+        add("World Type: Normal Overworld (multi-biome)",0,top+56,320,20,true);
+        add("Game Mode: Creative",0,top+80,220,20,true);
+        add("Generate Structures: Off",0,top+104,220,20,true);
+        add("Create World",0,logicalH-30,150);
+        add("Cancel",0,logicalH-30,150);
+        result[result.size()-2].x=(logicalW/2-154)*scale;
+        result.back().x=(logicalW/2+4)*scale;
         break;
     }
     case ClientApp::Screen::Multiplayer: {
-        add("Server: "+app.serverAddress,0,logicalH/2-64,320);
-        add("Username: "+app.username,0,logicalH/2-36,320);
-        add("Query Server Status",0,logicalH/2-4);
-        add("Connect (offline servers only)",0,logicalH/2+24,240);
-        add("Back",0,logicalH/2+52);
+        add("Server: "+app.serverAddress,0,48,320);
+        add("Username: "+app.username,0,72,320);
+        add("Query Server Status",0,logicalH-54,150);
+        add("Connect (offline servers only)",0,logicalH-54,150);
+        result[result.size()-2].x=(logicalW/2-154)*scale;
+        result.back().x=(logicalW/2+4)*scale;
+        add("Back",0,logicalH-30,150);
         break;
     }
+    case ClientApp::Screen::Loading:
+        add("Cancel Generation",0,logicalH-30,150);
+        break;
     case ClientApp::Screen::Paused:
         add("Resume Game",0,logicalH/2-24); add("Return to Title (session only)",0,logicalH/2+4,260);
         break;
     case ClientApp::Screen::Playing: break;
     }
     for(auto& button:result) {
-        if(button.x==0) button.x=(width-button.width)/2;
-        if(button.y==0) button.y=(height-button.height)/2;
+        if(button.x==0) button.x=((logicalW-button.width/scale)/2)*scale;
+        if(button.y==0) button.y=((logicalH-button.height/scale)/2)*scale;
+        button.hovered=app.mouse.x>=button.x && app.mouse.x<button.x+button.width &&
+            app.mouse.y>=button.y && app.mouse.y<button.y+button.height;
     }
-    (void)w;(void)h;
     return result;
 }
 
@@ -134,6 +160,7 @@ std::string menuTitle(ClientApp::Screen screen) {
     case ClientApp::Screen::Title:return "";
     case ClientApp::Screen::Worlds:return "Select World";
     case ClientApp::Screen::CreateWorld:return "Create New World";
+    case ClientApp::Screen::Loading:return "Preparing Normal Overworld";
     case ClientApp::Screen::Multiplayer:return "Multiplayer";
     case ClientApp::Screen::Paused:return "Game Menu";
     case ClientApp::Screen::Playing:return "";
@@ -142,9 +169,18 @@ std::string menuTitle(ClientApp::Screen screen) {
 }
 
 std::string menuSubtitle(const ClientApp& app) {
+    if(app.screen==ClientApp::Screen::Title) return {};
     if(!app.menuMessage.empty()) return app.menuMessage;
-    if(app.screen==ClientApp::Screen::Worlds) return app.session ? "World data exists only in this running session; disk saves are not implemented." : "No session worlds available.";
-    if(app.screen==ClientApp::Screen::CreateWorld) return app.inputField==0 ? "Type world name; Tab selects seed. Normal terrain is still under implementation." : "Signed decimal or Java String.hashCode; blank uses a random seed.";
+    if(app.screen==ClientApp::Screen::Worlds) return app.session ? "World data exists only in this running session; disk saves are not implemented." : "No saved worlds. Create a world to begin.";
+    if(app.screen==ClientApp::Screen::CreateWorld) return app.inputField==0
+        ? "Type world name; Tab selects seed. Normal multi-biome Overworld base terrain."
+        : "26.3 Normal base terrain only; carvers, features and structures are not generated. Seed: decimal or Java String.hashCode.";
+    if(app.screen==ClientApp::Screen::Loading) {
+        const auto complete=app.terrainProgress?app.terrainProgress->load():0;
+        const auto stage=app.terrainLoadStage?app.terrainLoadStage->load():0;
+        if(stage==1) return "Finding safe spawn; "+std::to_string(complete)+" terrain chunks generated";
+        return "Preparing initial view: "+std::to_string(std::min<std::size_t>(complete,9))+" / 9 chunks";
+    }
     if(app.screen==ClientApp::Screen::Multiplayer) {
         const auto state=app.multiplayer.poll();
         switch(state.state) {
@@ -158,7 +194,7 @@ std::string menuSubtitle(const ClientApp& app) {
         }
     }
     if(app.screen==ClientApp::Screen::Paused) return "Return to title keeps the current world only in memory.";
-    return "Java Edition 26.3 native client slice";
+    return {};
 }
 
 std::int64_t javaStringHash(const std::string& utf8) {
@@ -187,6 +223,125 @@ void openMenu(ClientApp& app,ClientApp::Screen screen) {
     else setCursorCapture(app,false);
 }
 
+int chunkCoordinate(int blockCoordinate) {
+    return blockCoordinate>=0?blockCoordinate/16:-((15-blockCoordinate)/16);
+}
+
+void cancelSeededWorldLoad(ClientApp& app) {
+    if(app.terrainCancel) app.terrainCancel->store(true);
+    app.pendingSession.reset();
+    if(app.screen==ClientApp::Screen::Loading) openMenu(app,ClientApp::Screen::CreateWorld);
+    app.menuMessage="World generation cancelled.";
+}
+
+void beginSeededWorldLoad(ClientApp& app, ClientApp::Session session) {
+    if(app.terrainLoad.valid()) {
+        if(app.terrainLoad.wait_for(std::chrono::seconds(0))!=std::future_status::ready) {
+            app.menuMessage="The previous generation task is still stopping. Try again in a moment.";
+            return;
+        }
+        try { (void)app.terrainLoad.get(); } catch(...) {}
+        app.terrainCancel.reset();
+    }
+    app.pendingSession=std::move(session);
+    app.terrainProgress=std::make_shared<std::atomic<std::size_t>>(0);
+    app.terrainLoadStage=std::make_shared<std::atomic<int>>(1);
+    app.terrainCancel=std::make_shared<std::atomic<bool>>(false);
+    const auto progress=app.terrainProgress;
+    const auto stage=app.terrainLoadStage;
+    const auto cancel=app.terrainCancel;
+    const auto root=app.sourceRoot;
+    const auto seed=app.pendingSession->seed;
+    app.terrainLoad=std::async(std::launch::async,[root,seed,progress,stage,cancel]() -> std::shared_ptr<const carbon::SeededOverworldChunkProvider> {
+        auto provider=std::make_shared<carbon::SeededOverworldChunkProvider>(seed,root);
+        const auto spawn=provider->safeSpawn(
+            [progress](std::size_t generated) { progress->store(generated); },
+            [cancel] { return cancel->load(); });
+        if(cancel->load()) return {};
+        const int centerX=chunkCoordinate(spawn.x),centerZ=chunkCoordinate(spawn.z);
+        stage->store(2);
+        std::size_t ready=0;
+        for(int cx=centerX-1;cx<=centerX+1;++cx) for(int cz=centerZ-1;cz<=centerZ+1;++cz)
+            if(provider->hasChunk(cx,cz)) ++ready;
+        progress->store(ready);
+        for(int cx=centerX-1;cx<=centerX+1;++cx) for(int cz=centerZ-1;cz<=centerZ+1;++cz) {
+            if(cancel->load()) return {};
+            const bool wasCached=provider->hasChunk(cx,cz);
+            (void)provider->chunk(cx,cz);
+            if(!wasCached) progress->fetch_add(1);
+        }
+        return provider;
+    });
+    openMenu(app,ClientApp::Screen::Loading);
+}
+
+void finishSeededWorldLoad(ClientApp& app) {
+    if(!app.terrainLoad.valid() ||
+       app.terrainLoad.wait_for(std::chrono::seconds(0))!=std::future_status::ready) return;
+    const bool cancelled=app.terrainCancel && app.terrainCancel->load();
+    try {
+        auto provider=app.terrainLoad.get();
+        app.terrainCancel.reset();
+        if(cancelled || app.screen!=ClientApp::Screen::Loading || !provider) {
+            app.pendingSession.reset();
+            return;
+        }
+        app.world=carbon::PlayableWorld::createSeededOverworld(std::move(provider));
+        app.session=std::move(app.pendingSession);
+        app.pendingSession.reset();
+        const auto spawnX=static_cast<int>(std::floor(app.world.player.position.x));
+        const auto spawnY=static_cast<int>(std::floor(app.world.player.position.y));
+        const auto spawnZ=static_cast<int>(std::floor(app.world.player.position.z));
+        app.currentBiome=app.world.seededTerrainProvider()->biomeAt(spawnX,spawnY,spawnZ);
+        app.visibleCenter={std::numeric_limits<int>::min(),0,0};
+        app.visibleWindowRadius=-1;
+        app.visibleRevision=std::numeric_limits<std::uint64_t>::max();
+        app.visibleSnapshotToken=0;
+        openMenu(app,ClientApp::Screen::Playing);
+        app.hud.status="Normal Overworld base terrain | seed "+std::to_string(app.session->seed)+" | session only";
+    } catch(const std::exception& error) {
+        app.terrainCancel.reset();
+        app.pendingSession.reset();
+        if(app.screen!=ClientApp::Screen::Loading) return;
+        openMenu(app,ClientApp::Screen::CreateWorld);
+        app.menuMessage="Seeded world generation failed: "+std::string(error.what());
+    }
+}
+
+bool seededWindowCached(const std::shared_ptr<const carbon::SeededOverworldChunkProvider>& provider,
+                        const carbon::BlockPos& center, int sectionRadius=2) {
+    if(!provider) return false;
+    const int cx=chunkCoordinate(center.x),cz=chunkCoordinate(center.z);
+    for(int x=cx-sectionRadius;x<=cx+sectionRadius;++x) for(int z=cz-sectionRadius;z<=cz+sectionRadius;++z)
+        if(!provider->hasChunk(x,z)) return false;
+    return true;
+}
+
+void beginTerrainStream(ClientApp& app, const carbon::BlockPos& center) {
+    if(app.terrainStream.valid()) return;
+    auto provider=app.world.seededTerrainProvider();
+    if(!provider) return;
+    const int cx=chunkCoordinate(center.x),cz=chunkCoordinate(center.z);
+    app.terrainStreamProgress=std::make_shared<std::atomic<std::size_t>>(0);
+    const auto progress=app.terrainStreamProgress;
+    app.terrainStreamCancel=std::make_shared<std::atomic<bool>>(false);
+    const auto cancel=app.terrainStreamCancel;
+    app.terrainStream=std::async(std::launch::async,[provider=std::move(provider),cx,cz,progress,cancel] {
+        for(int x=cx-2;x<=cx+2;++x) for(int z=cz-2;z<=cz+2;++z) {
+            if(cancel->load()) return;
+            (void)provider->chunk(x,z);
+            progress->fetch_add(1);
+        }
+    });
+}
+
+void finishTerrainStream(ClientApp& app) {
+    if(!app.terrainStream.valid() ||
+       app.terrainStream.wait_for(std::chrono::seconds(0))!=std::future_status::ready) return;
+    try { app.terrainStream.get(); app.terrainStreamCancel.reset(); }
+    catch(const std::exception& error) { app.terrainStreamCancel.reset(); app.hud.status="Terrain chunk generation failed: "+std::string(error.what()); }
+}
+
 void clickMenu(ClientApp& app,int x,int y) {
     RECT r{}; GetClientRect(app.window,&r);
     for(const auto& button:menuButtons(app,r.right,r.bottom)) {
@@ -196,11 +351,10 @@ void clickMenu(ClientApp& app,int x,int y) {
         case ClientApp::Screen::Title:
             if(button.label=="Singleplayer") openMenu(app,ClientApp::Screen::Worlds);
             else if(button.label=="Multiplayer") openMenu(app,ClientApp::Screen::Multiplayer);
-            else if(button.label=="Quit") PostMessageW(app.window,WM_CLOSE,0,0);
-            else if(button.label=="Options") app.menuMessage="Options are not implemented in this native slice.";
+            else if(button.label=="Quit Game") PostMessageW(app.window,WM_CLOSE,0,0);
             break;
         case ClientApp::Screen::Worlds:
-            if(button.label.rfind("Resume:",0)==0 && app.session) {
+            if((button.label=="Play Selected World" || (app.session && button.label==app.session->name+" (current session)")) && app.session) {
                 openMenu(app,ClientApp::Screen::Playing);
                 app.hud.status="Session resumed (memory only)";
             } else if(button.label=="Create New World") { app.worldName="New World"; app.seedText.clear(); openMenu(app,ClientApp::Screen::CreateWorld); }
@@ -209,18 +363,10 @@ void clickMenu(ClientApp& app,int x,int y) {
         case ClientApp::Screen::CreateWorld:
             if(button.label.rfind("World Name:",0)==0) app.inputField=0;
             else if(button.label.rfind("Seed:",0)==0) app.inputField=1;
-            else if(button.label.rfind("World Type:",0)==0) app.flatPresetSelected=!app.flatPresetSelected;
             else if(button.label=="Cancel") openMenu(app,ClientApp::Screen::Worlds);
             else if(button.label=="Create World") {
                 bool numeric=false; const auto seed=parseJavaSeed(app.seedText,numeric);
-                if(!app.flatPresetSelected) app.menuMessage="Normal Overworld generation is not yet available. Choose Classic Flat to play.";
-                else {
-                    app.session=ClientApp::Session{app.worldName.empty()?"New World":app.worldName,app.seedText,seed,numeric};
-                    app.world=carbon::PlayableWorld::createDefaultFlat();
-                    app.visibleCenter={std::numeric_limits<int>::min(),0,0}; app.visibleRevision=std::numeric_limits<std::uint64_t>::max();
-                    openMenu(app,ClientApp::Screen::Playing);
-                    app.hud.status="Classic Flat | seed "+std::to_string(seed)+" | memory only";
-                }
+                beginSeededWorldLoad(app,ClientApp::Session{app.worldName.empty()?"New World":app.worldName,app.seedText,seed,numeric});
             }
             break;
         case ClientApp::Screen::Multiplayer:
@@ -236,6 +382,9 @@ void clickMenu(ClientApp& app,int x,int y) {
                 }
             }
             break;
+        case ClientApp::Screen::Loading:
+            if(button.label=="Cancel Generation") cancelSeededWorldLoad(app);
+            break;
         case ClientApp::Screen::Paused:
             if(button.label=="Resume Game") openMenu(app,ClientApp::Screen::Playing);
             else if(button.label.rfind("Return to Title",0)==0) openMenu(app,ClientApp::Screen::Title);
@@ -248,7 +397,7 @@ void clickMenu(ClientApp& app,int x,int y) {
 
 void setCursorCapture(ClientApp& app, bool capture) {
     app.paused = !capture;
-    app.hud.status = capture ? "Classic Flat | WASD walk | Space jump | Double Space flight | Shift sneak | Ctrl sprint | Esc pause"
+    app.hud.status = capture ? "Seeded terrain | WASD walk | Space jump | Double Space flight | Shift sneak | Ctrl sprint | Esc pause"
                             : "Paused | Esc to resume";
     if (capture) {
         RECT rect{};
@@ -320,13 +469,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (wParam == VK_ESCAPE) {
                 if(app->screen==ClientApp::Screen::Playing) openMenu(*app,ClientApp::Screen::Paused);
                 else if(app->screen==ClientApp::Screen::Paused) openMenu(*app,ClientApp::Screen::Playing);
+                else if(app->screen==ClientApp::Screen::Loading) cancelSeededWorldLoad(*app);
                 else if(app->screen==ClientApp::Screen::CreateWorld) openMenu(*app,ClientApp::Screen::Worlds);
                 else if(app->screen==ClientApp::Screen::Worlds) openMenu(*app,ClientApp::Screen::Title);
                 else if(app->screen==ClientApp::Screen::Multiplayer) { app->multiplayer.cancel(); openMenu(*app,ClientApp::Screen::Title); }
             }
             if(app->screen==ClientApp::Screen::CreateWorld && wParam==VK_TAB) app->inputField=app->inputField==0?1:0;
             if(app->screen==ClientApp::Screen::Multiplayer && wParam==VK_TAB) app->inputField=app->inputField==2?3:2;
-            if(app->screen!=ClientApp::Screen::Playing && wParam==VK_BACK) {
+            if((app->screen==ClientApp::Screen::CreateWorld || app->screen==ClientApp::Screen::Multiplayer) && wParam==VK_BACK) {
                 auto& value=app->screen==ClientApp::Screen::CreateWorld?(app->inputField==0?app->worldName:app->seedText):(app->inputField==3?app->username:app->serverAddress);
                 if(!value.empty()) value.pop_back();
             }
@@ -338,12 +488,15 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_CHAR:
-        if(app && app->screen!=ClientApp::Screen::Playing && wParam>=32 && wParam<127) {
+        if(app && (app->screen==ClientApp::Screen::CreateWorld || app->screen==ClientApp::Screen::Multiplayer) && wParam>=32 && wParam<127) {
             auto& value=app->screen==ClientApp::Screen::CreateWorld?(app->inputField==0?app->worldName:app->seedText):(app->inputField==3?app->username:app->serverAddress);
             if(value.size()<128) value.push_back(static_cast<char>(wParam));
         }
         return 0;
-    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_CLOSE:
+        if(app && app->terrainCancel) app->terrainCancel->store(true);
+        if(app && app->terrainStreamCancel) app->terrainStreamCancel->store(true);
+        DestroyWindow(hwnd); return 0;
     case WM_DESTROY: if (app) app->running = false; PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -371,6 +524,7 @@ fs::path defaultSourceRoot() {
 
 void tick(ClientApp& app) {
     if (app.paused || !app.focused) return;
+    app.dayTime=(app.dayTime+1)%24000;
     // Java Options defaults to sensitivity 0.5. MouseHandler applies
     // (sensitivity*0.6+0.2)^3*8 then the player turn multiplier 0.15.
     constexpr float degreesPerPixel = 0.15F;
@@ -384,6 +538,22 @@ void tick(ClientApp& app) {
     input.jump = keyDown(VK_SPACE);
     input.descend = keyDown(VK_SHIFT);
     input.sprint = keyDown(VK_LCONTROL) || keyDown(VK_RCONTROL);
+    bool nearbyTerrainReady=true;
+    if(app.world.hasSeededTerrain()) {
+        const auto terrain=app.world.seededTerrainProvider();
+        const int cx=chunkCoordinate(static_cast<int>(std::floor(app.world.player.position.x)));
+        const int cz=chunkCoordinate(static_cast<int>(std::floor(app.world.player.position.z)));
+        for(int x=cx-1;x<=cx+1 && nearbyTerrainReady;++x)
+            for(int z=cz-1;z<=cz+1;++z)
+                if(!terrain->hasChunk(x,z)) { nearbyTerrainReady=false; break; }
+    }
+    if(!nearbyTerrainReady) {
+        input={};
+        app.leftPressed=false;
+        app.rightPressed=false;
+        app.pickPressed=false;
+        app.hud.status="Waiting for nearby terrain chunks...";
+    }
     const bool wasFlying = app.world.player.flying;
     app.world.tickCreativeMove(input);
     if (wasFlying != app.world.player.flying)
@@ -425,7 +595,9 @@ void tick(ClientApp& app) {
     }
 }
 
-int runClient(fs::path sourceRoot) {
+int runClient(fs::path sourceRoot, fs::path smokeMenuImage = {}, fs::path smokeWorldImage = {},
+              fs::path smokeStreamImage = {}, fs::path smokeTracePath = {},
+              int windowWidth = kWidth, int windowHeight = kHeight, std::int64_t smokeSeed = 12345) {
     ClientApp app;
     app.sourceRoot = std::move(sourceRoot);
     const auto instance = GetModuleHandleW(nullptr);
@@ -437,7 +609,7 @@ int runClient(fs::path sourceRoot) {
     wc.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) throw std::runtime_error("Could not register Carbon window class");
 
-    RECT rect{0, 0, kWidth, kHeight};
+    RECT rect{0, 0, windowWidth, windowHeight};
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
     app.window = CreateWindowExW(0, kWindowClass, L"Carbon | Java Edition 26.3 native slice", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, instance, &app);
@@ -446,7 +618,7 @@ int runClient(fs::path sourceRoot) {
     RAWINPUTDEVICE mouse{0x01, 0x02, 0, app.window};
     RegisterRawInputDevices(&mouse, 1, sizeof(mouse));
     std::string error;
-    if (!app.renderer.initialize(app.window, kWidth, kHeight, app.sourceRoot, &error)) {
+    if (!app.renderer.initialize(app.window, windowWidth, windowHeight, app.sourceRoot, &error)) {
         DestroyWindow(app.window);
         throw std::runtime_error("Renderer startup failed: " + error);
     }
@@ -455,6 +627,32 @@ int runClient(fs::path sourceRoot) {
     setCursorCapture(app, false);
 
     using clock = std::chrono::steady_clock;
+    const bool smokeMode=!smokeTracePath.empty();
+    if(smokeMode) app.dayTime=6000;
+    std::ofstream smokeTrace;
+    if(smokeMode) {
+        if(!smokeTracePath.parent_path().empty()) fs::create_directories(smokeTracePath.parent_path());
+        smokeTrace.open(smokeTracePath,std::ios::binary|std::ios::trunc);
+        if(!smokeTrace) throw std::runtime_error("Could not create client smoke trace: "+smokeTracePath.string());
+        smokeTrace<<"elapsed_ms\tscreen\tload_stage\tload_chunks\tstream_chunks\tcached_chunks\tvisible_blocks\tmesh_builds\tpresents\tframe_ms\tworld_ms\n";
+        smokeTrace.flush();
+    }
+    int smokeClickStage=0;
+    bool smokeMenuCaptured=false,smokeWorldCaptured=false,smokeFirstWorldFrameDone=false,smokeRelocated=false,smokeStreamCaptured=false,smokeFailed=false;
+    std::size_t smokeTicksInPlay=0;
+    std::uint64_t smokeLoopFrames=0,smokeLoadingFrames=0;
+    double smokeMaxLoopGapMs=0.0,smokeLoadMs=0.0,smokeFirstWorldFrameMs=0.0,smokeStreamMs=0.0;
+    std::optional<clock::time_point> smokeLoadStarted,smokeWorldReadyAt,smokePlayingStarted,smokeStreamStarted;
+    auto smokeStart=clock::now(),smokePreviousLoop=smokeStart,smokeLastTrace=smokeStart;
+    auto smokePostButton=[&](std::string_view label) {
+        RECT r{}; GetClientRect(app.window,&r);
+        for(const auto& button:menuButtons(app,r.right,r.bottom)) if(button.label==label) {
+            return PostMessageW(app.window,WM_LBUTTONDOWN,MK_LBUTTON,
+                MAKELPARAM(button.x+button.width/2,button.y+button.height/2))!=FALSE;
+        }
+        return false;
+    };
+
     auto previous = clock::now();
     double accumulator = 0;
     constexpr auto frameDuration = std::chrono::milliseconds(16);
@@ -467,9 +665,51 @@ int runClient(fs::path sourceRoot) {
         }
         if (!app.running) break;
         const auto now = clock::now();
+        if(smokeMode) {
+            ++smokeLoopFrames;
+            smokeMaxLoopGapMs=std::max(smokeMaxLoopGapMs,std::chrono::duration<double,std::milli>(now-smokePreviousLoop).count());
+            smokePreviousLoop=now;
+            if(app.screen==ClientApp::Screen::Loading) ++smokeLoadingFrames;
+            if(app.screen==ClientApp::Screen::Playing && !smokePlayingStarted) smokePlayingStarted=now;
+            if(smokeClickStage==0 && app.screen==ClientApp::Screen::Title) {
+                if(smokePostButton("Singleplayer")) smokeClickStage=1;
+                else { app.error="Smoke runner could not find the Singleplayer button"; smokeFailed=true; app.running=false; }
+            } else if(smokeClickStage==1 && app.screen==ClientApp::Screen::Worlds) {
+                if(smokePostButton("Create New World")) smokeClickStage=2;
+                else { app.error="Smoke runner could not find the Create New World button"; smokeFailed=true; app.running=false; }
+            } else if(smokeClickStage==2 && app.screen==ClientApp::Screen::CreateWorld) {
+                app.seedText=std::to_string(smokeSeed);
+                if(smokePostButton("Create World")) {
+                    smokeClickStage=3;
+                    smokeLoadStarted=now;
+                } else { app.error="Smoke runner could not find the Create World button"; smokeFailed=true; app.running=false; }
+            }
+            if(smokeClickStage>=3 && app.screen==ClientApp::Screen::CreateWorld && !app.menuMessage.empty()) {
+                app.error="World join did not complete: "+app.menuMessage;
+                smokeFailed=true; app.running=false;
+            }
+            if(now-smokeStart>std::chrono::minutes(8) && !smokeStreamCaptured) {
+                app.error="Smoke run exceeded its 8 minute deadline";
+                smokeFailed=true; app.running=false;
+            }
+        }
+        if(!app.running) break;
+        finishSeededWorldLoad(app);
+        if(smokeMode && app.screen==ClientApp::Screen::Playing && !smokeWorldReadyAt) {
+            smokeWorldReadyAt=clock::now();
+            if(smokeLoadStarted) smokeLoadMs=std::chrono::duration<double,std::milli>(*smokeWorldReadyAt-*smokeLoadStarted).count();
+        }
+        if(smokeMode && app.screen==ClientApp::Screen::Playing && !smokePlayingStarted) smokePlayingStarted=clock::now();
+        finishTerrainStream(app);
         accumulator += std::chrono::duration<double>(now - previous).count();
         previous = now;
-        while (accumulator >= kTickSeconds) { if(app.screen==ClientApp::Screen::Playing) tick(app); accumulator -= kTickSeconds; }
+        while (accumulator >= kTickSeconds) {
+            if(app.screen==ClientApp::Screen::Playing) {
+                tick(app);
+                if(smokeMode) ++smokeTicksInPlay;
+            }
+            accumulator -= kTickSeconds;
+        }
         RECT client{};
         GetClientRect(app.window, &client);
         if(app.screen==ClientApp::Screen::Playing) {
@@ -477,21 +717,124 @@ int runClient(fs::path sourceRoot) {
                                           sectionAnchor(static_cast<int>(std::floor(app.world.player.position.y))),
                                           sectionAnchor(static_cast<int>(std::floor(app.world.player.position.z))));
             const auto revision=app.world.sceneRevision();
-            if (center!=app.visibleCenter || revision!=app.visibleRevision) {
-                app.visibleBlocks=app.world.blocksInSectionWindow(center,2,kSectionWindowRadius);
-                app.visibleCenter=center; app.visibleRevision=revision; ++app.visibleSnapshotToken;
+            if (center!=app.visibleCenter || revision!=app.visibleRevision || app.world.hasSeededTerrain()) {
+                int readyRadius=2;
+                if(app.world.hasSeededTerrain()) {
+                    const auto provider=app.world.seededTerrainProvider();
+                    readyRadius=seededWindowCached(provider,center,2)?2:
+                                seededWindowCached(provider,center,1)?1:-1;
+                }
+                if(!app.world.hasSeededTerrain() || readyRadius>=1) {
+                    if(center!=app.visibleCenter || revision!=app.visibleRevision || readyRadius!=app.visibleWindowRadius) {
+                        app.visibleBlocks=app.world.blocksInSectionWindow(center,readyRadius,kSectionWindowRadius);
+                        app.visibleCenter=center; app.visibleWindowRadius=readyRadius;
+                        app.visibleRevision=revision; ++app.visibleSnapshotToken;
+                    }
+                    if(app.world.hasSeededTerrain() && readyRadius<2) {
+                        beginTerrainStream(app,center);
+                        const auto ready=app.terrainStreamProgress?app.terrainStreamProgress->load():0;
+                        app.hud.status="Loading terrain around you "+std::to_string(std::min<std::size_t>(ready,25))+" / 25 chunks";
+                    }
+                    if(app.world.hasSeededTerrain() && app.visibleSnapshotToken==1 && app.visibleBlocks.empty()) {
+                        openMenu(app,ClientApp::Screen::CreateWorld);
+                        app.menuMessage="World loading failed: the generated spawn window contains no renderable blocks.";
+                    }
+                } else {
+                    beginTerrainStream(app,center);
+                    const auto ready=app.terrainStreamProgress?app.terrainStreamProgress->load():0;
+                    app.hud.status="Loading terrain around you "+std::to_string(std::min<std::size_t>(ready,25))+" / 25 chunks";
+                }
             }
-            app.renderer.render(app.visibleBlocks, app.world.player, app.hud, revision, app.visibleSnapshotToken);
+            const carbon::RenderBlockBounds fluidBounds{center.x-40,center.x+39,
+                center.y-kSectionWindowRadius,center.y+kSectionWindowRadius,
+                center.z-40,center.z+39};
+            const int playerX=static_cast<int>(std::floor(app.world.player.position.x));
+            const int playerY=static_cast<int>(std::floor(app.world.player.position.y));
+            const int playerZ=static_cast<int>(std::floor(app.world.player.position.z));
+            const auto visualTerrain=app.world.seededTerrainProvider();
+            if(visualTerrain && visualTerrain->hasChunk(chunkCoordinate(playerX),chunkCoordinate(playerZ)))
+                app.currentBiome=visualTerrain->biomeAt(playerX,playerY,playerZ);
+            const carbon::WorldVisualState visualState{app.currentBiome,app.dayTime,kPlayerViewRadius/12};
+            app.renderer.render(app.visibleBlocks, app.world.player, app.hud, revision,
+                                app.visibleSnapshotToken,&fluidBounds,&visualState);
+            if(smokeMode && app.world.hasSeededTerrain() && smokePlayingStarted && !smokeFirstWorldFrameDone) {
+                smokeFirstWorldFrameMs=std::chrono::duration<double,std::milli>(clock::now()-*smokePlayingStarted).count();
+                smokeFirstWorldFrameDone=true;
+            }
         } else {
             const auto buttons=menuButtons(app,client.right,client.bottom);
             app.renderer.renderMenu(menuTitle(app.screen),buttons,app.screen==ClientApp::Screen::Title,menuSubtitle(app));
         }
+        if(smokeMode && app.screen==ClientApp::Screen::Title && !smokeMenuCaptured) {
+            if(!app.renderer.writeScreenshot(smokeMenuImage,&app.error)) { smokeFailed=true; app.running=false; }
+            else smokeMenuCaptured=true;
+        }
+        if(smokeMode && app.screen==ClientApp::Screen::Playing && app.world.hasSeededTerrain()) {
+            if(!smokeWorldCaptured && smokeTicksInPlay>=10) {
+                if(!app.renderer.writeScreenshot(smokeWorldImage,&app.error)) { smokeFailed=true; app.running=false; }
+                else {
+                    smokeWorldCaptured=true;
+                    app.world.player.flying=true;
+                    app.world.player.position.x+=48.0;
+                    smokeRelocated=true;
+                    smokeStreamStarted=clock::now();
+                }
+            } else if(smokeRelocated && !smokeStreamCaptured) {
+                const carbon::BlockPos smokeCenter(sectionAnchor(static_cast<int>(std::floor(app.world.player.position.x))),
+                    sectionAnchor(static_cast<int>(std::floor(app.world.player.position.y))),
+                    sectionAnchor(static_cast<int>(std::floor(app.world.player.position.z))));
+                if(smokeCenter==app.visibleCenter && seededWindowCached(app.world.seededTerrainProvider(),smokeCenter)) {
+                    if(!app.renderer.writeScreenshot(smokeStreamImage,&app.error)) { smokeFailed=true; app.running=false; }
+                    else {
+                        smokeStreamCaptured=true;
+                        if(smokeStreamStarted) smokeStreamMs=std::chrono::duration<double,std::milli>(clock::now()-*smokeStreamStarted).count();
+                        app.running=false;
+                    }
+                }
+            }
+        }
+        if(smokeMode) {
+            const auto traceNow=clock::now();
+            if(traceNow-smokeLastTrace>=std::chrono::milliseconds(500)) {
+                const auto terrain=app.world.seededTerrainProvider();
+                const auto cached=terrain?terrain->cachedChunkCount():0;
+                const auto loadStage=app.terrainLoadStage?app.terrainLoadStage->load():0;
+                const auto loadChunks=app.terrainProgress?app.terrainProgress->load():0;
+                const auto streamChunks=app.terrainStreamProgress?app.terrainStreamProgress->load():0;
+                const auto& stats=app.renderer.performanceStats();
+                smokeTrace<<std::chrono::duration_cast<std::chrono::milliseconds>(traceNow-smokeStart).count()<<'\t'
+                    <<static_cast<int>(app.screen)<<'\t'<<loadStage<<'\t'<<loadChunks<<'\t'<<streamChunks<<'\t'<<cached<<'\t'
+                    <<app.visibleBlocks.size()<<'\t'<<stats.meshBuilds<<'\t'<<app.renderer.presentedFrames()<<'\t'
+                    <<stats.lastCpuFrameMs<<'\t'<<stats.lastWorldDrawMs<<'\n';
+                smokeTrace.flush();
+                smokeLastTrace=traceNow;
+            }
+        }
         const auto spent = clock::now() - frameStart;
+        if(smokeMode) smokeMaxLoopGapMs=std::max(smokeMaxLoopGapMs,std::chrono::duration<double,std::milli>(spent).count());
         if (spent < frameDuration) std::this_thread::sleep_for(frameDuration - spent);
     }
     setCursorCapture(app, false);
     app.renderer.shutdown();
     UnregisterClassW(kWindowClass, instance);
+    if(smokeMode) {
+        if(!smokeMenuCaptured||!smokeWorldCaptured||!smokeStreamCaptured) smokeFailed=true;
+        smokeTrace<<"# result: "<<(smokeFailed?"FAIL":"PASS")<<"\n# menu_capture="<<smokeMenuCaptured
+            <<" world_capture="<<smokeWorldCaptured<<" stream_capture="<<smokeStreamCaptured
+            <<" load_ms="<<smokeLoadMs<<" first_world_frame_ms="<<smokeFirstWorldFrameMs
+            <<" stream_ms="<<smokeStreamMs<<" loading_frames="<<smokeLoadingFrames
+            <<" loop_frames="<<smokeLoopFrames<<" max_loop_gap_ms="<<smokeMaxLoopGapMs
+            <<" visible_blocks="<<app.visibleBlocks.size()<<" mesh_builds="<<app.renderer.performanceStats().meshBuilds
+            <<" error="<<app.error<<"\n";
+        smokeTrace.flush();
+        std::cout<<"Native client join smoke: "<<(smokeFailed?"FAIL":"PASS")
+            <<" load_ms="<<smokeLoadMs<<" first_world_frame_ms="<<smokeFirstWorldFrameMs
+            <<" stream_ms="<<smokeStreamMs<<" loading_frames="<<smokeLoadingFrames
+            <<" loop_frames="<<smokeLoopFrames<<" max_loop_gap_ms="<<smokeMaxLoopGapMs
+            <<" menu="<<smokeMenuCaptured<<" world="<<smokeWorldCaptured<<" stream="<<smokeStreamCaptured
+            <<" error="<<app.error<<'\n';
+        return smokeFailed?2:0;
+    }
     return 0;
 }
 
@@ -511,14 +854,18 @@ int runDiagnostics(const fs::path& root) {
             if (entry.is_regular_file()) { ++files; bytes += entry.file_size(); }
     std::cout << "\nOriginal resource/data files: " << files << " (" << bytes << " bytes)\n"
               << "Original waypoint style loaded: " << sample->size() << " bytes\n"
-              << "Implemented client slice: Java classic superflat preset, creative flight, nine-slot supported-block hotbar with source-backed 3D item icons, pick-block, break/place, supported source block models, dry stone slab/stair states and oak-fence states.\n"
-              << "Native UI: title, world selection/flat creation, multiplayer pregame and pause screens; multiplayer supports server status ping and an offline-mode login start only, with no authentication or configuration/gameplay handoff.\n"
+              << "Implemented client slice: source-backed 26.3 Normal multi-biome overworld base terrain, creative flight, nine-slot supported-block hotbar, pick-block, break/place, supported source block models and stationary water/lava source rendering. Carvers, features and save files are not implemented.\n"
+              << "Native UI: title, world selection/Normal Overworld creation, loading progress/cancellation, multiplayer pregame and pause screens; multiplayer supports server status ping and an offline-mode login start only, with no authentication or configuration/gameplay handoff.\n"
               << "Omitted: complete registries/resource reload, full light propagation, entities, survival, full inventory/codecs, disk saves, integrated server, complete Java screens and full Java parity.\n";
     return 0;
 }
 }
 
 int main(int argc, char** argv) try {
+    if (argc == 8 && std::string_view(argv[1]) == "--smoke-world-load")
+        return runClient(defaultSourceRoot(),argv[4],argv[5],argv[6],argv[7],std::stoi(argv[2]),std::stoi(argv[3]));
+    if (argc == 9 && std::string_view(argv[1]) == "--smoke-world-load")
+        return runClient(defaultSourceRoot(),argv[4],argv[5],argv[6],argv[7],std::stoi(argv[2]),std::stoi(argv[3]),std::stoll(argv[8]));
     if (argc == 3 && std::string_view(argv[1]) == "--random-vectors") {
         carbon::LegacyRandomSource random(std::stoll(argv[2]));
         std::cout << std::setprecision(17);
@@ -531,7 +878,7 @@ int main(int argc, char** argv) try {
     if (argc == 3 && std::string_view(argv[1]) == "--source-root") return runClient(argv[2]);
     if (argc == 2 && std::string_view(argv[1]) == "--diagnostics") return runDiagnostics(defaultSourceRoot());
     if (argc == 3 && std::string_view(argv[1]) == "--diagnostics-source-root") return runDiagnostics(argv[2]);
-    if (argc != 1) throw std::invalid_argument("Usage: carbon [--diagnostics [--source-root <directory>]] | --random-vectors <seed>");
+    if (argc != 1) throw std::invalid_argument("Usage: carbon [--diagnostics [--source-root <directory>]] | --random-vectors <seed> | --smoke-world-load <width> <height> <menu.ppm> <world.ppm> <stream.ppm> <trace.tsv> [seed]");
     return runClient(defaultSourceRoot());
 } catch (const std::exception& error) {
     std::cerr << "Carbon: " << error.what() << '\n';

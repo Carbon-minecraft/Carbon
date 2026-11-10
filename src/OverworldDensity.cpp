@@ -24,6 +24,15 @@ std::size_t DensityContext::MemoHash::operator()(const MemoKey& k) const noexcep
     return h;
 }
 
+float DensityContext::InterpolatedVolume::at(int x,int y,int z) const {
+    if(x<minX||x>=minX+sizeX||y<minY||y>=minY+sizeY||z<minZ||z>=minZ+sizeZ)
+        throw std::out_of_range("prepared interpolation sample outside chunk volume");
+    const auto index=(static_cast<std::size_t>(z-minZ)*static_cast<std::size_t>(sizeX)+
+                      static_cast<std::size_t>(x-minX))*static_cast<std::size_t>(sizeY)+
+                      static_cast<std::size_t>(y-minY);
+    return values.at(index);
+}
+
 OverworldDensityGraph::OverworldDensityGraph(std::filesystem::path dataRoot)
     : root_(std::move(dataRoot)) {}
 
@@ -46,6 +55,69 @@ float OverworldDensityGraph::sample(const std::string& key,DensityPos pos,const 
 float OverworldDensityGraph::sampleExpression(const nlohmann::json& expression,DensityPos pos,
                                                const DensityContext& context) const {
     return eval(expression,pos,context,0);
+}
+
+void OverworldDensityGraph::prepareInterpolatedChunk(const std::string& key,int chunkX,int chunkZ,
+                                                      int minY,int height,const DensityContext& context) const {
+    if(!context.interpolatedVolumes) return;
+    if(height<=0) throw std::invalid_argument("prepared interpolation height must be positive");
+    const int minX=chunkX*16,minZ=chunkZ*16,maxX=minX+15,maxZ=minZ+15;
+    std::vector<const Json*> nodes;
+    std::unordered_map<std::string,bool> visited;
+    std::function<void(const Json&,int)> walk = [&](const Json& node,int recursion) {
+        if(recursion>256) throw std::runtime_error("density graph traversal recursion limit exceeded");
+        if(node.is_string()) {
+            std::string ref=node.get<std::string>();
+            if(ref.rfind("minecraft:overworld/",0)==0) ref.erase(0,10);
+            if(ref.rfind("overworld/",0)==0 && visited.emplace(ref,true).second) walk(load(ref),recursion+1);
+            return;
+        }
+        if(node.is_array()) { for(const auto& child:node) walk(child,recursion+1); return; }
+        if(!node.is_object()) return;
+        if(node.value("type",std::string{})=="minecraft:interpolated") nodes.push_back(&node);
+        for(auto it=node.begin();it!=node.end();++it) walk(it.value(),recursion+1);
+    };
+    walk(load(key),0);
+    for(const Json* node:nodes) {
+        const int cellXZ=node->value("cell_size_xz",4),cellY=node->value("cell_size_y",8);
+        if(cellXZ<=0||cellY<=0) throw std::runtime_error("interpolated density cell sizes must be positive");
+        const int x0=floorDiv(minX,cellXZ)*cellXZ,z0=floorDiv(minZ,cellXZ)*cellXZ;
+        const int y0=floorDiv(minY,cellY)*cellY;
+        const int xCells=floorDiv(maxX,cellXZ)-floorDiv(minX,cellXZ)+1;
+        const int zCells=floorDiv(maxZ,cellXZ)-floorDiv(minZ,cellXZ)+1;
+        const int yCells=floorDiv(minY+height-1,cellY)-floorDiv(minY,cellY)+1;
+        const int gridX=xCells+1,gridY=yCells+1,gridZ=zCells+1;
+        std::vector<float> corners(static_cast<std::size_t>(gridX)*gridY*gridZ);
+        auto cornerIndex=[&](int x,int y,int z) {
+            return (static_cast<std::size_t>(z)*static_cast<std::size_t>(gridY)+static_cast<std::size_t>(y))*
+                   static_cast<std::size_t>(gridX)+static_cast<std::size_t>(x);
+        };
+        for(int z=0;z<gridZ;++z) for(int x=0;x<gridX;++x) for(int y=0;y<gridY;++y)
+            corners[cornerIndex(x,y,z)]=eval(node->at("input"),
+                {x0+x*cellXZ,y0+y*cellY,z0+z*cellXZ},context,1);
+
+        DensityContext::InterpolatedVolume volume;
+        volume.node=node;volume.minX=minX;volume.minY=minY;volume.minZ=minZ;
+        volume.sizeX=16;volume.sizeY=height;volume.sizeZ=16;
+        volume.values.resize(static_cast<std::size_t>(16)*height*16);
+        for(int z=0;z<16;++z) for(int x=0;x<16;++x) for(int y=0;y<height;++y) {
+            const int wx=minX+x,wy=minY+y,wz=minZ+z;
+            const int cx=floorDiv(wx,cellXZ)*cellXZ,cy=floorDiv(wy,cellY)*cellY,cz=floorDiv(wz,cellXZ)*cellXZ;
+            const int ix=(cx-x0)/cellXZ,iy=(cy-y0)/cellY,iz=(cz-z0)/cellXZ;
+            const float tx=static_cast<float>(wx-cx)/cellXZ,ty=static_cast<float>(wy-cy)/cellY,tz=static_cast<float>(wz-cz)/cellXZ;
+            const float v000=corners[cornerIndex(ix,iy,iz)],v100=corners[cornerIndex(ix+1,iy,iz)];
+            const float v010=corners[cornerIndex(ix,iy+1,iz)],v110=corners[cornerIndex(ix+1,iy+1,iz)];
+            const float v001=corners[cornerIndex(ix,iy,iz+1)],v101=corners[cornerIndex(ix+1,iy,iz+1)];
+            const float v011=corners[cornerIndex(ix,iy+1,iz+1)],v111=corners[cornerIndex(ix+1,iy+1,iz+1)];
+            const float a00=lerp(tx,v000,v100),a10=lerp(tx,v010,v110);
+            const float a01=lerp(tx,v001,v101),a11=lerp(tx,v011,v111);
+            const float value=lerp(tz,lerp(ty,a00,a10),lerp(ty,a01,a11));
+            const auto index=(static_cast<std::size_t>(z)*16u+static_cast<std::size_t>(x))*
+                             static_cast<std::size_t>(height)+static_cast<std::size_t>(y);
+            volume.values[index]=value;
+        }
+        context.interpolatedVolumes->insert_or_assign(node,std::move(volume));
+    }
 }
 
 float RawDensityChunk::at(int x,int y,int z) const {
@@ -141,6 +213,15 @@ float OverworldDensityGraph::evalImpl(const Json& n,DensityPos p,const DensityCo
         return 4.0F*c.noise(n.at("noise").get<std::string>(),x,y,z);
     }
     if(type=="minecraft:interpolated") {
+        if(c.interpolatedVolumes) {
+            if(auto found=c.interpolatedVolumes->find(&n);found!=c.interpolatedVolumes->end()) {
+                const auto& volume=found->second;
+                if(p.x>=volume.minX&&p.x<volume.minX+volume.sizeX&&
+                   p.y>=volume.minY&&p.y<volume.minY+volume.sizeY&&
+                   p.z>=volume.minZ&&p.z<volume.minZ+volume.sizeZ)
+                    return volume.at(p.x,p.y,p.z);
+            }
+        }
         const int sx=n.value("cell_size_xz",4),sy=n.value("cell_size_y",8);
         const int x0=floorDiv(p.x,sx)*sx,y0=floorDiv(p.y,sy)*sy,z0=floorDiv(p.z,sx)*sx;
         const float tx=float(p.x-x0)/sx,ty=float(p.y-y0)/sy,tz=float(p.z-z0)/sx;
@@ -234,6 +315,11 @@ float SeededOverworldDensity::Session::function(const std::string& identifier,in
 
 float SeededOverworldDensity::Session::finalDensity(int x,int y,int z) const {
     return function("overworld/final_density",x,y,z);
+}
+
+void SeededOverworldDensity::Session::prepareFinalDensityChunk(int chunkX,int chunkZ) const {
+    owner_->graph_.prepareInterpolatedChunk("overworld/final_density",chunkX,chunkZ,
+                                            RawDensityChunk::MIN_Y,RawDensityChunk::HEIGHT,context_);
 }
 
 float SeededOverworldDensity::Session::noise(const std::string& identifier,double x,double y,double z) const {

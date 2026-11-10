@@ -61,6 +61,18 @@ int main(int argc,char** argv) {
     auto raw=seeded.densityChunk(-2,3);
     assert(raw.at(0,-20,0)==seeded.finalDensity(-32,-20,48));
     assert(raw.surfaceY(0,0)>=carbon::RawDensityChunk::MIN_Y);
+    // The generated-chunk sampler precomputes source interpolated density
+    // volumes from 4x8 cell corners. Verify the optimized session preserves
+    // the unprepared graph's exact float bits at negative-coordinate edges,
+    // negative-Y cell seams, and the top of the native world volume.
+    auto direct=seeded.beginSession();
+    auto prepared=seeded.beginSession();
+    prepared.prepareFinalDensityChunk(-2,3);
+    for (const int x : {-32,-31,-29,-28,-27,-17,-16})
+        for (const int z : {48,49,51,52,53,62,63})
+            for (const int y : {-64,-63,-57,-56,-1,0,7,8,319})
+                assert(std::bit_cast<std::uint32_t>(direct.finalDensity(x,y,z)) ==
+                       std::bit_cast<std::uint32_t>(prepared.finalDensity(x,y,z)));
     carbon::SeededOverworldDensity probes(42,argv[1]);
     std::cout<<std::setprecision(9);
     for(const auto p : {carbon::DensityPos{0,64,0},carbon::DensityPos{0,128,0},

@@ -51,6 +51,8 @@ int main(int argc, char** argv) {
     assert(carbon::sourceAutoGuiScale(319, 239) == 1);
     assert(carbon::sourceAutoGuiScale(640, 480) == 2);
     assert(carbon::sourceAutoGuiScale(1280, 720) == 3);
+    assert(carbon::sourceAutoGuiScale(854, 480) == 2);
+    assert(carbon::sourceAutoGuiScale(2549, 1527) == 6);
     assert(carbon::sourceAutoGuiScale(1280, 720, true) == 4);
 
     // Exercise odd/even framebuffer widths and non-divisible GUI scaling.

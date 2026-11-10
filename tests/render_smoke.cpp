@@ -64,6 +64,9 @@ int wmain(int argc, wchar_t** argv) try {
         std::string error;
         if (!renderer.initialize(hwnd,960,540,sourceRoot,&error))
             throw std::runtime_error("renderer.initialize: "+error);
+        // Reproduce the normal menu-to-world transition: renderMenu leaves a
+        // black clear color and 2D projection that the world pass must replace.
+        renderer.renderMenu("Sky state transition",{},false);
         auto world=carbon::PlayableWorld::createDefaultFlat();
         // Add source-backed cubes, slabs, stairs, and connected fences to
         // exercise original blockstates plus CLASSIC_FLAT terrain.
@@ -176,6 +179,9 @@ int wmain(int argc, wchar_t** argv) try {
         const auto withoutItems=readPpm(noItemsPath);
         require(withItems.width==withoutItems.width && withItems.height==withoutItems.height,
                 "HUD comparison screenshots have different dimensions");
+        const auto skyPixel=(static_cast<std::size_t>(20)*withItems.width+480u)*3u;
+        require(withItems.rgb[skyPixel+2]>withItems.rgb[skyPixel],
+                "menu-to-world transition left the daytime sky black or failed to render the source-blue sky disc");
         const auto samePixel=[&](int x,int y) {
             const auto at=(static_cast<std::size_t>(y)*withItems.width+static_cast<std::size_t>(x))*3;
             return withItems.rgb[at]==withoutItems.rgb[at] && withItems.rgb[at+1]==withoutItems.rgb[at+1] &&

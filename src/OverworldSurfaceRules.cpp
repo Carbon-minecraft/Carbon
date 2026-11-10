@@ -29,7 +29,16 @@ PlainsSurfaceRules::PlainsSurfaceRules(std::filesystem::path root)
             generator.at("settings")=="minecraft:overworld" &&
             generator.at("biome_source").at("type")=="minecraft:fixed" &&
             generator.at("biome_source").at("biome")=="minecraft:plains";
-        if(!presetMatchesSource_) error_="Source single_biome_surface preset is not fixed minecraft:plains with minecraft:overworld settings";
+        std::ifstream normalInput(dataRoot_/"world_preset"/"normal.json",std::ios::binary);
+        if(!normalInput) throw std::runtime_error("missing source world_preset/normal.json");
+        const auto normal=nlohmann::json::parse(normalInput);
+        const auto& normalGenerator=normal.at("dimensions").at("minecraft:overworld").at("generator");
+        normalPresetMatchesSource_=normalGenerator.at("type")=="minecraft:noise" &&
+            normalGenerator.at("settings")=="minecraft:overworld" &&
+            normalGenerator.at("biome_source").at("type")=="minecraft:multi_noise" &&
+            normalGenerator.at("biome_source").at("preset")=="minecraft:overworld";
+        if(!presetMatchesSource_ && !normalPresetMatchesSource_)
+            error_="Source presets do not match supported fixed-plains or normal multi-noise Overworld configurations";
     } catch(const std::exception& e) { error_=e.what(); }
 }
 
@@ -124,10 +133,15 @@ std::optional<std::string> PlainsSurfaceRules::rule(const nlohmann::json& n,cons
 }
 
 std::optional<std::string> PlainsSurfaceRules::surfaceBlockAt(const MaterialRuleSample& sample) {
-    if(!presetMatchesSource_ || sample.biome!="minecraft:plains") return {};
-    // These are the exact roots selected by the 26.3 overworld surface rule:
-    // `on_floor -> minecraft:overworld/biome_surface` and
-    // `under_floor -> minecraft:overworld/under_biome_surface`.
+    if(!presetMatchesSource_ && !normalPresetMatchesSource_) return {};
+    if(presetMatchesSource_ && sample.biome!="minecraft:plains") return {};
+    // The normal preset reaches the complete source surface rule graph, which
+    // dispatches by the biome sampled at the current quart position.
+    if(normalPresetMatchesSource_) {
+        if(sample.onFloor) return ruleReference("minecraft:overworld/surface",sample,0);
+        if(sample.underFloor) return ruleReference("minecraft:overworld/under_biome_surface",sample,0);
+        return {};
+    }
     if(sample.onFloor) return ruleReference("minecraft:overworld/biome_surface",sample,0);
     if(sample.underFloor) return ruleReference("minecraft:overworld/under_biome_surface",sample,0);
     return {};
